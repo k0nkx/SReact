@@ -18,7 +18,7 @@
     const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet, MessageActions, MessageStore;
+    let RestAPI, ActionSheet, MessageActions, MessageStore, UserStore;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
@@ -238,11 +238,11 @@
                     const status = errorStatus(e);
                     if (status === 429) {
                         showToast(`Rate limited (429), stopped after ${sent} reaction(s)`);
-                        return;
+                        return { sent, failed };
                     }
                     if (status === 401 || status === 403) {
                         showToast(`No permission to react (${status}), stopped`);
-                        return;
+                        return { sent, failed };
                     }
                     // Bad emoji or some other per-emoji failure: skip it and carry on.
                     failed++;
@@ -254,9 +254,11 @@
             if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
             else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
             else showToast(`Added ${sent}/${emojis.length} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
+            return { sent, failed };
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
+            return { sent, failed };
         } finally {
             running = false;
         }
@@ -301,48 +303,167 @@
         return bestScore >= 0.5 ? best : null;
     }
 
-    // Newest message from that user in the channel: loaded messages first, then the API.
-    async function findLatestMessage(channelId, userId) {
+    const recentFromStore = (channelId, limit) => {
         try {
             MessageStore ??= findByStoreName?.("MessageStore");
             const col = MessageStore?.getMessages?.(channelId);
             const arr = col?.toArray?.() ?? col?._array ?? [];
-            for (let i = arr.length - 1; i >= 0; i--) {
-                if (arr[i]?.author?.id === userId) return arr[i];
-            }
+            return arr.slice(-limit).reverse(); // newest first
         } catch (e) {
             log.error("Reaction Spam: message store lookup failed", e);
+            return [];
         }
+    };
+
+    // Recent messages, newest first. Asks the API (accurate reactions), falls back to what's loaded.
+    // skipId is our own status message (and anything newer), which must not be counted.
+    async function fetchRecent(channelId, limit, skipId) {
         try {
-            const res = await RestAPI.get({ url: `/channels/${channelId}/messages`, query: { limit: 100 } });
-            return (res?.body ?? []).find(m => m?.author?.id === userId) ?? null; // newest first
+            const query = { limit: Math.min(100, Math.max(1, limit)) };
+            if (skipId) query.before = skipId;
+            const res = await RestAPI.get({ url: `/channels/${channelId}/messages`, query });
+            if (Array.isArray(res?.body)) return res.body;
         } catch (e) {
             log.error("Reaction Spam: couldn't fetch recent messages", e);
         }
-        return null;
+        return recentFromStore(channelId, limit + 1).filter(m => m?.id !== skipId).slice(0, limit);
     }
 
-    // Returns true if the text was a command (so the message shouldn't be sent).
+    // Newest message from that user in the channel: loaded messages first, then the API.
+    async function findLatestMessage(channelId, userId, skipId) {
+        const local = recentFromStore(channelId, 200).find(m => m?.author?.id === userId && m.id !== skipId);
+        if (local) return local;
+        return (await fetchRecent(channelId, 100, skipId)).find(m => m?.author?.id === userId) ?? null;
+    }
+
+    // Removes YOUR reactions from the given messages (Discord only lets you remove your own here).
+    async function removeMyReactions(messages, channelId) {
+        const del = RestAPI.del ?? RestAPI.delete;
+        const delay = Math.max(0, parseInt(storage.delay, 10) || 0);
+        let removed = 0;
+        for (const m of messages) {
+            for (const r of m?.reactions ?? []) {
+                if (!r?.me) continue;
+                const key = r.emoji?.id ? `${r.emoji.name}:${r.emoji.id}` : r.emoji?.name;
+                if (!key) continue;
+                try {
+                    await del.call(RestAPI, {
+                        url: `/channels/${m.channel_id ?? channelId}/messages/${m.id}/reactions/${encodeURIComponent(key)}/@me`
+                    });
+                    removed++;
+                } catch (e) {
+                    if (errorStatus(e) === 429) return removed;
+                    log.error("Reaction Spam: couldn't remove a reaction", key, e);
+                }
+                if (delay) await sleep(delay);
+            }
+        }
+        return removed;
+    }
+
+    const userName = id => {
+        try {
+            UserStore ??= findByStoreName?.("UserStore");
+            const u = UserStore?.getUser?.(id);
+            return u?.globalName ?? u?.username ?? "someone";
+        } catch (e) {
+            return "someone";
+        }
+    };
+
+    // Posts the command as a visible message (without pinging anyone), runs the job, edits the
+    // message to the outcome, then deletes it 2 seconds later.
+    async function runWithStatus(channelId, shownText, job) {
+        let sentId = null;
+        try {
+            const res = await RestAPI.post({
+                url: `/channels/${channelId}/messages`,
+                body: { content: shownText, allowed_mentions: { parse: [] } }
+            });
+            sentId = res?.body?.id ?? null;
+        } catch (e) {
+            log.error("Reaction Spam: couldn't post the command message", e);
+        }
+
+        let outcome = "failed";
+        try {
+            outcome = (await job(sentId)) || "failed";
+        } catch (e) {
+            log.error("Reaction Spam: command failed", e);
+        }
+
+        if (!sentId) return;
+        try {
+            await RestAPI.patch({ url: `/channels/${channelId}/messages/${sentId}`, body: { content: outcome } });
+        } catch (e) {
+            log.error("Reaction Spam: couldn't edit the command message", e);
+        }
+        await sleep(2000);
+        try {
+            await (RestAPI.del ?? RestAPI.delete).call(RestAPI, { url: `/channels/${channelId}/messages/${sentId}` });
+        } catch (e) {
+            log.error("Reaction Spam: couldn't delete the command message", e);
+        }
+    }
+
+    // Commands (default prefix ";"):
+    //   ;flame @someone   -> spam the closest-named preset onto their latest message
+    //   ;undo 10          -> remove your reactions from the last 10 messages
+    //   ;undo @someone    -> remove your reactions from their latest reacted-to message
+    // Returns true if the text was a command (so the original message isn't sent).
     function handleCommand(channelId, content) {
         const prefix = storage.prefix || ";";
         if (typeof content !== "string" || !content.startsWith(prefix)) return false;
-        const m = content.slice(prefix.length).match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
-        if (!m) return false;
+        const body = content.slice(prefix.length);
 
-        const [, query, userId] = m;
-        const preset = findClosestPreset(query);
-        if (!preset) {
-            storage.lastRun = `Command "${query.trim()}": no preset with a similar name`;
-            return true;
+        const undoUser = body.match(/^\s*undo\s+<@!?(\d+)>\s*$/i);
+        const undoCount = body.match(/^\s*undo(?:\s+(\d{1,3}))?\s*$/i);
+        const spamCmd = body.match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
+
+        let job;
+        if (undoUser) {
+            const userId = undoUser[1];
+            job = async skipId => {
+                const msgs = await fetchRecent(channelId, 50, skipId);
+                const target = msgs.find(m => m?.author?.id === userId && (m.reactions ?? []).some(r => r?.me));
+                if (!target) return "nothing to undo";
+                const removed = await removeMyReactions([target], channelId);
+                storage.lastRun = `undo @${userName(userId)}: removed ${removed} reaction(s)`;
+                return removed > 0 ? "finished" : "failed";
+            };
+        } else if (undoCount) {
+            const n = Math.min(100, Math.max(1, parseInt(undoCount[1], 10) || 1));
+            job = async skipId => {
+                const msgs = (await fetchRecent(channelId, n, skipId)).slice(0, n);
+                const mine = msgs.filter(m => (m?.reactions ?? []).some(r => r?.me));
+                if (!mine.length) return "nothing to undo";
+                const removed = await removeMyReactions(mine, channelId);
+                storage.lastRun = `undo ${n}: removed ${removed} reaction(s) from ${mine.length} message(s)`;
+                return removed > 0 ? "finished" : "failed";
+            };
+        } else if (spamCmd) {
+            const [, query, userId] = spamCmd;
+            job = async skipId => {
+                const preset = findClosestPreset(query);
+                if (!preset) {
+                    storage.lastRun = `Command "${query.trim()}": no preset with a similar name`;
+                    return "no matching preset";
+                }
+                const target = await findLatestMessage(channelId, userId, skipId);
+                if (!target) {
+                    storage.lastRun = `${preset.name}: couldn't find a recent message from that person`;
+                    return "no recent message found";
+                }
+                const result = await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
+                return result && result.sent > 0 ? "finished" : "failed";
+            };
+        } else {
+            return false;
         }
-        (async () => {
-            const target = await findLatestMessage(channelId, userId);
-            if (!target) {
-                storage.lastRun = `${preset.name}: couldn't find a recent message from that person`;
-                return;
-            }
-            await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
-        })().catch(e => log.error("Reaction Spam: command failed", e));
+
+        // Show the message in chat, but as plain text so the mention doesn't ping anyone.
+        const shown = content.replace(/<@!?(\d+)>/g, (_, id) => "@" + userName(id));
+        runWithStatus(channelId, shown, job).catch(e => log.error("Reaction Spam: command error", e));
         return true;
     }
 
@@ -514,7 +635,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v11 (presets + chat command)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v12 (presets + chat commands)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -533,8 +654,9 @@
                     onChangeText: v => { storage.prefix = v.trim(); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Type e.g. \";flame @someone\" in any chat. It finds the preset with the closest name, " +
-                    "adds its emojis to that person's latest message, and doesn't send your text.")
+                    "Commands: \";flame @someone\" adds the closest-named preset's emojis to their latest message. " +
+                    "\";undo 10\" removes your reactions from the last 10 messages, \";undo @someone\" from their latest reacted-to message. " +
+                    "Your command shows in chat, changes to \"finished\", then is deleted 2 seconds later.")
             ),
             ...presetCards,
             button("+ Add a new button", add, "#5865f2"),
