@@ -308,7 +308,12 @@
 
     function addRow(tree, message) {
         const rows = findInReactTree(tree, x => Array.isArray(x) && x.some(isRow));
-        if (!rows || rows.some(r => typeof r?.key === "string" && r.key.startsWith("reaction-spam"))) return;
+        if (!rows) return;
+        // Discord can reuse the same rows array between renders, so drop our old rows and rebuild
+        // them every time instead of skipping. That way they always match the current presets.
+        for (let i = rows.length - 1; i >= 0; i--) {
+            if (typeof rows[i]?.key === "string" && rows[i].key.startsWith("reaction-spam")) rows.splice(i, 1);
+        }
         const template = rows.find(isRow);
         const icons = ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"];
         const hide = () => ActionSheet?.hideActionSheet?.();
@@ -324,15 +329,13 @@
         }
 
         // One menu button per preset.
-        for (const preset of storage.presets ?? []) {
-            const id = preset.id;
-            const snap = plain(preset);
-            rows.push(makeRow(template, `reaction-spam-${id}`, preset.name || "Spam Reactions", icons, () => {
+        (storage.presets ?? []).map(plain).forEach((snap, i) => {
+            rows.push(makeRow(template, `reaction-spam-${i}-${snap.id}`, snap.name || "Spam Reactions", icons, () => {
                 hide();
-                const live = (storage.presets ?? []).find(p => p.id === id);
+                const live = storage.presets?.[i];
                 spam(message, live ? plain(live) : snap);
             }));
-        }
+        });
     }
 
     function patchSheet() {
@@ -379,8 +382,8 @@
         const card = { backgroundColor: "#2b2d31", borderRadius: 12, padding: 14, gap: 12 };
 
         const presets = (Array.isArray(storage.presets) ? storage.presets : []).map(plain);
-        const update = (id, patch) => { storage.presets = presets.map(p => p.id === id ? { ...p, ...patch } : p); };
-        const remove = id => { storage.presets = presets.filter(p => p.id !== id); };
+        const update = (i, patch) => { storage.presets = presets.map((p, j) => j === i ? { ...p, ...patch } : p); };
+        const remove = i => { storage.presets = presets.filter((p, j) => j !== i); };
         const add = () => { storage.presets = [...presets, { id: newId(), name: "New preset", emojis: "" }]; };
 
         const button = (text, onPress, color) => React.createElement(TouchableOpacity, {
@@ -388,7 +391,7 @@
             style: { backgroundColor: color, borderRadius: 8, paddingVertical: 10, alignItems: "center" }
         }, React.createElement(Text, { style: { color: "#ffffff", fontWeight: "600", fontSize: 15 } }, text));
 
-        const presetCards = presets.map(p => React.createElement(View, { key: p.id, style: card },
+        const presetCards = presets.map((p, i) => React.createElement(View, { key: `${i}-${p.id}`, style: card },
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Button name"),
                 React.createElement(TextInput, {
@@ -396,7 +399,7 @@
                     value: p.name ?? "",
                     placeholder: "e.g. Flame Skull",
                     placeholderTextColor: "#80848e",
-                    onChangeText: v => update(p.id, { name: v })
+                    onChangeText: v => update(i, { name: v })
                 })
             ),
             React.createElement(View, null,
@@ -407,14 +410,14 @@
                     value: p.emojis ?? "",
                     placeholder: "😂 💀 🔥  or  :skullcry:  or  <:name:id>",
                     placeholderTextColor: "#80848e",
-                    onChangeText: v => update(p.id, { emojis: v })
+                    onChangeText: v => update(i, { emojis: v })
                 })
             ),
-            button("Delete this button", () => remove(p.id), "#da373c")
+            button("Delete this button", () => remove(i), "#da373c")
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v9 (presets)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v10 (presets)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -446,6 +449,16 @@
             if (!Array.isArray(storage.presets)) {
                 // First run on this version: your old emoji list becomes the first button.
                 storage.presets = [{ id: "default", name: "Spam Reactions", emojis: storage.emojis ?? DEFAULT_EMOJIS }];
+            }
+            {
+                // Repair presets saved without an id, or sharing one, so each button is separate.
+                const used = new Set();
+                storage.presets = storage.presets.map(plain).map(pr => {
+                    let id = pr.id;
+                    if (!id || used.has(id)) id = newId();
+                    used.add(id);
+                    return { ...pr, id };
+                });
             }
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
