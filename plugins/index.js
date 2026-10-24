@@ -4,25 +4,9 @@
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
     const { showToast: rawToast } = vendetta.ui.toasts;
-    // Discord's toast renderer now expects a position; missing it crashes useToastContainer.
+    // Always hand Discord a short plain string so a long or odd message can't break the toast.
     const showToast = msg => {
-        try {
-            const content = String(msg ?? "").replace(/\s+/g, " ").slice(0, 100);
-            const toasts = findByProps("open", "close") ?? vendetta.metro.common.toasts;
-            if (toasts?.open) {
-                toasts.open({
-                    key: `rs-${Date.now()}`,
-                    content,
-                    icon: null,
-                    source: null,
-                    position: 0
-                });
-            } else {
-                rawToast(content);
-            }
-        } catch (e) {
-            log.error("Reaction Spam: toast failed", e);
-        }
+        try { rawToast(String(msg ?? "").replace(/\s+/g, " ").slice(0, 100)); } catch (e) { log.error("Reaction Spam: toast failed", e); }
     };
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
@@ -50,7 +34,7 @@
         for (const t of tokens) {
             const custom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
             // Unicode emojis typed with no spaces between them ("😂💀🔥") are split apart here.
-            const keys = custom ? [`\( {custom[1]}: \){custom[2]}`] : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
+            const keys = custom ? [`${custom[1]}:${custom[2]}`] : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
             for (const key of keys) {
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -81,7 +65,7 @@
             if (isFlag(g) && i < cps.length && isFlag(cps[i])) g += cps[i++];
             while (i < cps.length) {
                 if (isMod(cps[i])) g += cps[i++];
-                else if (cps[i] === "‍" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
+                else if (cps[i] === "" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
                 else break;
             }
             out.push(g);
@@ -93,7 +77,7 @@
 
     function addReaction(channelId, messageId, emoji) {
         return RestAPI.put({
-            url: `/channels/\( {channelId}/messages/ \){messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+            url: `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
             query: { location: "Message Reaction Picker", type: 0 }
         });
     }
@@ -148,7 +132,7 @@
             }
             if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
             else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            else showToast(`Added \( {sent}/ \){emojis.length} reaction(s)${failed ? `, \( {failed} failed ( \){errorText(lastError)})` : ""}`);
+            else showToast(`Added ${sent}/${emojis.length} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
