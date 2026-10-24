@@ -3,15 +3,23 @@
     const { React, ReactNative } = vendetta.metro.common;
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
-    const { showToast: rawToast } = vendetta.ui.toasts;
-    // Always hand Discord a short plain string so a long or odd message can't break the toast.
-    const showToast = msg => {
-        try { rawToast(String(msg ?? "").replace(/\s+/g, " ").slice(0, 100)); } catch (e) { log.error("Reaction Spam: toast failed", e); }
-    };
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
     const { useProxy } = vendetta.storage;
     const log = vendetta.logger;
+
+    // Discord's own toast container crashes ("Cannot read property 'position' of undefined"),
+    // so use the native Android toast instead. Falls back to an alert on other platforms.
+    const showToast = msg => {
+        const text = String(msg ?? "").replace(/\s+/g, " ").slice(0, 100);
+        try {
+            const { ToastAndroid, Platform, Alert } = ReactNative;
+            if (Platform.OS === "android" && ToastAndroid) ToastAndroid.show(text, ToastAndroid.SHORT);
+            else Alert.alert("Reaction Spam", text);
+        } catch (e) {
+            log.error("Reaction Spam: toast failed", e);
+        }
+    };
 
     const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
@@ -65,7 +73,7 @@
             if (isFlag(g) && i < cps.length && isFlag(cps[i])) g += cps[i++];
             while (i < cps.length) {
                 if (isMod(cps[i])) g += cps[i++];
-                else if (cps[i] === "" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
+                else if (cps[i] === "\u200D" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
                 else break;
             }
             out.push(g);
@@ -91,7 +99,6 @@
         const msg = e?.body?.message ?? e?.message ?? (typeof e === "string" ? e : "");
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
     }
-
 
     async function spam(message) {
         if (running) return showToast("Reaction spam already running");
