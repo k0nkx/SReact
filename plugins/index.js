@@ -1,5 +1,5 @@
 (() => {
-    const { findByProps } = vendetta.metro;
+    const { findByProps, findByStoreName } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
     const { before, after, instead } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
@@ -17,7 +17,7 @@
 
     // Discord's hard limit is 20 unique reactions per message. Hitting it makes Discord itself
     // pop its (broken) "max reactions" toast and crash, so stay one under the limit.
-    const MAX_REACTIONS = 20;
+    const MAX_REACTIONS = 19;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
     let RestAPI, ActionSheet;
@@ -30,17 +30,57 @@
 
     // ---- Emoji parsing ------------------------------------------------------------
 
-    // Accepts unicode emojis, <:name:id>, <a:name:id> or name:id, split on spaces/commas.
+    // Looks up custom server emojis by name (for ":skullcry:" style input) using Discord's emoji store.
+    let EmojiStore;
+    function customEmojiList() {
+        const list = [];
+        const push = e => { if (e && typeof e.id === "string" && typeof e.name === "string") list.push(e); };
+        const eachOf = c => c instanceof Map ? [...c.values()] : Array.isArray(c) ? c : Object.values(c ?? {});
+        try {
+            EmojiStore ??= findByStoreName?.("EmojiStore") ?? findByProps("getCustomEmojiById", "getGuilds");
+            const store = EmojiStore;
+            if (!store) return list;
+            try {
+                eachOf(store.getGuilds?.()).forEach(g => eachOf(g?.emojis ?? g?.getEmojis?.()).forEach(push));
+            } catch (e) { /* try the next source */ }
+            try {
+                eachOf(store.getDisambiguatedEmojiContext?.()?.customEmojis).forEach(push);
+            } catch (e) { /* try the next source */ }
+            try {
+                eachOf(store.getUsableCustomEmojis?.()).forEach(push);
+            } catch (e) { /* ignore */ }
+        } catch (e) {
+            log.error("Reaction Spam: couldn't read the emoji store", e);
+        }
+        // Emojis the user can actually use come first.
+        return list.sort((a, b) => (b.available !== false) - (a.available !== false));
+    }
+
+    function resolveShortcode(name, getList) {
+        const list = getList();
+        const lower = name.toLowerCase();
+        const hit = list.find(e => e.name === name) ?? list.find(e => e.name.toLowerCase() === lower);
+        if (!hit) log.error(`Reaction Spam: no custom emoji named :${name}:`);
+        return hit ? `${hit.name}:${hit.id}` : null;
+    }
+
+    // Accepts unicode emojis, :name: (custom server emoji), <:name:id>, <a:name:id> or name:id,
+    // split on spaces/commas.
     function parseEmojis(raw) {
         const out = [];
         const seen = new Set();
+        let cache;
+        const getList = () => (cache ??= customEmojiList());
         const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
         for (const t of tokens) {
             const custom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
             // Unicode emojis typed with no spaces between them ("😂💀🔥") are split apart here.
-            const keys = custom ? [`${custom[1]}:${custom[2]}`] : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
+            const short = t.match(/^:(\w+):$/);
+            const keys = custom ? [`${custom[1]}:${custom[2]}`]
+                : short ? [resolveShortcode(short[1], getList)]
+                : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
             for (const key of keys) {
-                if (seen.has(key)) continue;
+                if (!key || seen.has(key)) continue;
                 seen.add(key);
                 out.push(key);
                 if (out.length >= MAX_REACTIONS) return out;
@@ -248,7 +288,7 @@
         };
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v3 (no toasts, cap 19)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v4 (no toasts, cap 19, :name: emojis)"),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Emojis (max 19)"),
                 React.createElement(TextInput, {
@@ -260,7 +300,7 @@
                     onChangeText: v => { storage.emojis = v; }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Separate with spaces or commas. Custom emojis: <:name:id> or name:id. " +
+                    "Separate with spaces or commas. Custom server emojis: :name: (e.g. :skullcry:), <:name:id> or name:id. " +
                     "Discord only allows 20 unique reactions per message, so duplicates are removed and the list is capped at 19 to avoid the limit.")
             ),
             React.createElement(View, null,
