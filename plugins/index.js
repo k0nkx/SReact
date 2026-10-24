@@ -17,7 +17,7 @@
 
     // Discord's hard limit is 20 unique reactions per message. Hitting it makes Discord itself
     // pop its (broken) "max reactions" toast and crash, so stay one under the limit.
-    const MAX_REACTIONS = 20;
+    const MAX_REACTIONS = 19;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
     let RestAPI, ActionSheet;
@@ -219,6 +219,8 @@
             await loadRestEmojis();
             emojis = parseEmojis(preset.emojis);
         }
+        storage.lastRun = `${preset.name || "preset"}: ${emojis.length ? emojis.join(" ") : "nothing to react with"}`
+            + (missingShortcodes.length ? ` (not found: ${missingShortcodes.map(n => ":" + n + ":").join(" ")})` : "");
         if (!emojis.length) return showToast("Add some emojis to this preset in the plugin settings first");
 
         const delay = Math.max(0, parseInt(storage.delay, 10) || 0);
@@ -324,9 +326,11 @@
         // One menu button per preset.
         for (const preset of storage.presets ?? []) {
             const id = preset.id;
+            const snap = plain(preset);
             rows.push(makeRow(template, `reaction-spam-${id}`, preset.name || "Spam Reactions", icons, () => {
                 hide();
-                spam(message, (storage.presets ?? []).find(p => p.id === id));
+                const live = (storage.presets ?? []).find(p => p.id === id);
+                spam(message, live ? plain(live) : snap);
             }));
         }
     }
@@ -410,7 +414,8 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v8 (presets)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v9 (presets)"),
+            React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
             })()),
