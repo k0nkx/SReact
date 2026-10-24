@@ -17,7 +17,7 @@
 
     // Discord's hard limit is 20 unique reactions per message. Hitting it makes Discord itself
     // pop its (broken) "max reactions" toast and crash, so stay one under the limit.
-    const MAX_REACTIONS = 19;
+    const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
     let RestAPI, ActionSheet;
