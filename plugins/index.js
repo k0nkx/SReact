@@ -11,7 +11,7 @@
     // Discord's own toast container crashes ("Cannot read property 'position' of undefined"),
     // so use the native Android toast instead. Falls back to an alert on other platforms.
     const showToast = msg => {
-        const text = String(msg ?? "").replace(/\s+/g, " ").slice(0, 100);
+        const text = ("[v2] " + String(msg ?? "")).replace(/\s+/g, " ").slice(0, 100);
         try {
             const { ToastAndroid, Platform, Alert } = ReactNative;
             if (Platform.OS === "android" && ToastAndroid) ToastAndroid.show(text, ToastAndroid.SHORT);
