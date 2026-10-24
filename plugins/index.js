@@ -1,6 +1,6 @@
 (() => {
     const { findByProps } = vendetta.metro;
-    const { React, ReactNative, toasts } = vendetta.metro.common;
+    const { React, ReactNative } = vendetta.metro.common;
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
     const { getAssetIDByName } = vendetta.ui.assets;
@@ -11,34 +11,18 @@
     const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet, ReactionActions, uuid4;
+    let RestAPI, ActionSheet, ReactionActions;
     const unpatches = [];
     let running = false;
     let cancelled = false;
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    // Safe toast (works after Discord toast API change)
-    function showToast(content, asset) {
+    // Completely safe "toast" – never touches Discord's toast system
+    function showToast(content) {
         try {
-            const vdShow = vendetta?.ui?.toasts?.showToast;
-            if (typeof vdShow === "function") return vdShow(content, asset);
+            log.info("[Reactions]", content);
         } catch {}
-
-        try {
-            if (!uuid4) uuid4 = findByProps("uuid4")?.uuid4;
-            if (toasts?.open) {
-                toasts.open({
-                    key: `reactions-toast-${uuid4 ? uuid4() : Date.now()}`,
-                    content,
-                    source: asset,
-                    icon: asset,
-                });
-                return;
-            }
-        } catch (e) {
-            log.error("Reaction Spam: toast failed", e);
-        }
         console.log("[Reactions]", content);
     }
 
@@ -155,7 +139,7 @@
         }
     }
 
-    // ---- Long-press menu (modern MessageLongPressActionSheet) ----------------------
+    // ---- Long-press menu ----------------------------------------------------------
 
     function patchSheet() {
         ActionSheet = findByProps("openLazy", "hideActionSheet");
@@ -164,30 +148,22 @@
             return;
         }
 
-        // Try to get ActionSheetRow for modern Discord
         const ActionSheetRowModule = findByProps("ActionSheetRow");
         const ActionSheetRow = ActionSheetRowModule?.ActionSheetRow;
 
         unpatches.push(before("openLazy", ActionSheet, ([lazy, key, data]) => {
-            // Modern key is exactly "MessageLongPressActionSheet"
             if (typeof key !== "string" || !key.includes("MessageLongPress")) return;
 
-            const message = data?.message ?? data?.messageId ? data : null;
-            // Some builds put the message in different places
-            const msg = data?.message || (data?.channel && data?.messageId ? { id: data.messageId, channel_id: data.channel?.id || data.channelId } : null);
-            if (!msg?.id && !message?.id) return;
-
-            const targetMessage = msg?.id ? msg : message;
+            const msg = data?.message || (data?.messageId ? { id: data.messageId, channel_id: data.channel?.id || data.channelId } : null);
+            if (!msg?.id) return;
 
             Promise.resolve(lazy).then(mod => {
                 if (!mod) return;
 
                 const unpatch = after("default", mod, (args, component) => {
-                    // Clean up this temporary patch when the sheet unmounts
                     React.useEffect(() => () => { try { unpatch(); } catch {} }, []);
 
                     try {
-                        // Strategy 1: find array of ButtonRow / ActionSheetRow
                         let rows = findInReactTree(component, x =>
                             Array.isArray(x) &&
                             x.some(child =>
@@ -197,7 +173,6 @@
                             )
                         );
 
-                        // Strategy 2: broader search for pressable rows
                         if (!rows) {
                             rows = findInReactTree(component, x =>
                                 Array.isArray(x) &&
@@ -225,15 +200,14 @@
                                 cancelled = true;
                                 showToast("Stopping...");
                             } else {
-                                // Reconstruct a usable message object
-                                const fullMsg = targetMessage.channel_id
-                                    ? targetMessage
-                                    : { id: targetMessage.id, channel_id: data?.channel?.id || data?.channelId || targetMessage.channel_id };
+                                const fullMsg = {
+                                    id: msg.id,
+                                    channel_id: msg.channel_id || data?.channel?.id || data?.channelId
+                                };
                                 spam(fullMsg);
                             }
                         };
 
-                        // Prefer creating a proper ActionSheetRow when available
                         if (ActionSheetRow) {
                             rows.push(
                                 React.createElement(ActionSheetRow, {
@@ -244,16 +218,11 @@
                                 })
                             );
                         } else {
-                            // Fallback: clone an existing row
                             const template = rows.find(r =>
                                 r?.props && typeof r.props.label === "string" && typeof r.props.onPress === "function"
                             );
                             if (template) {
-                                const props = {
-                                    key: "reaction-spam",
-                                    label,
-                                    onPress,
-                                };
+                                const props = { key: "reaction-spam", label, onPress };
                                 if (iconId) {
                                     if (React.isValidElement(template.props.icon)) {
                                         props.icon = React.cloneElement(template.props.icon, { source: iconId });
@@ -263,12 +232,7 @@
                                 }
                                 rows.push(React.cloneElement(template, props));
                             } else {
-                                // Last resort: plain object style some older sheets accept
-                                rows.push({
-                                    key: "reaction-spam",
-                                    label,
-                                    onPress,
-                                });
+                                rows.push({ key: "reaction-spam", label, onPress });
                             }
                         }
                     } catch (e) {
@@ -285,7 +249,7 @@
         useProxy(storage);
         const { ScrollView, View, Text, TextInput } = ReactNative;
 
-        const label = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
+        const labelStyle = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
         const hint = { color: "#b5bac1", fontSize: 13, marginTop: 6 };
         const input = {
             color: "#ffffff",
@@ -298,7 +262,7 @@
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
             React.createElement(View, null,
-                React.createElement(Text, { style: label }, "Emojis (max 20)"),
+                React.createElement(Text, { style: labelStyle }, "Emojis (max 20)"),
                 React.createElement(TextInput, {
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
@@ -312,7 +276,7 @@
                     "Discord only allows 20 unique reactions per message.")
             ),
             React.createElement(View, null,
-                React.createElement(Text, { style: label }, "Delay between reactions (ms)"),
+                React.createElement(Text, { style: labelStyle }, "Delay between reactions (ms)"),
                 React.createElement(TextInput, {
                     style: input,
                     value: String(storage.delay ?? ""),
@@ -322,7 +286,7 @@
                     onChangeText: v => { storage.delay = v.replace(/[^0-9]/g, ""); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Long press a message → Spam Reactions. Stops on 429. Raise delay if needed.")
+                    "Long press a message → Spam Reactions. Stops on 429. Raise delay if needed.\n\nNote: Toasts are disabled to avoid a Discord crash. Check the console/logs for feedback.")
             )
         );
     }
