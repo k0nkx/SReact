@@ -1,0 +1,14 @@
+{
+  "name": "Reactions",
+  "description": "Stops on a 429.",
+  "authors": [
+    {
+      "name": "@fqxk on discord"
+    }
+  ],
+  "main": "index.js",
+  "hash": "a93a4e0ae5da73314f3c2c5df86a59266160a6ce05823c55ab3565fd30a99c17",
+  "vendetta": {
+    "icon": "ic_add_reaction_24px"
+  }
+}
