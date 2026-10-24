@@ -16,6 +16,7 @@
     };
 
     const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
+    const DEFAULT_CENSOR = "job work working shower soap employed";
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
     let RestAPI, ActionSheet, MessageActions, MessageStore, UserStore;
@@ -418,6 +419,7 @@
 
         const undoUser = body.match(/^\s*undo\s+<@!?(\d+)>\s*$/i);
         const undoCount = body.match(/^\s*undo(?:\s+(\d{1,3}))?\s*$/i);
+        const censorCmd = body.match(/^\s*(un)?censor\s*$/i);
         const spamCmd = body.match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
 
         let job;
@@ -457,6 +459,13 @@
                 const result = await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
                 return result && result.sent > 0 ? "finished" : "failed";
             };
+        } else if (censorCmd) {
+            const on = !censorCmd[1];
+            job = async () => {
+                storage.censor = on;
+                storage.lastRun = `censor ${on ? "on" : "off"}`;
+                return on ? "censor on" : "censor off";
+            };
         } else {
             return false;
         }
@@ -465,6 +474,24 @@
         const shown = content.replace(/<@!?(\d+)>/g, (_, id) => "@" + userName(id));
         runWithStatus(channelId, shown, job).catch(e => log.error("Reaction Spam: command error", e));
         return true;
+    }
+
+    // ---- Censor ---------------------------------------------------------------------
+    // ";censor" turns on auto-censoring of your outgoing messages, ";uncensor" turns it off.
+    // Listed words get every "o" swapped for a block, e.g. "Job" becomes "J◼b". Mentions, custom
+    // emojis, links and code are left alone.
+
+    const censorWordList = () => String(storage.censorWords ?? DEFAULT_CENSOR).split(/[\s,]+/).filter(Boolean);
+
+    function censorText(text) {
+        const words = censorWordList().sort((a, b) => b.length - a.length);
+        if (!words.length) return text;
+        const escape = w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`\\b(${words.map(escape).join("|")})\\b`, "gi");
+        return text
+            .split(/(```[\s\S]*?```|`[^`\n]*`|<[^>\s]+>|https?:\/\/\S+)/)
+            .map((part, i) => (i % 2 ? part : part.replace(re, m => m.replace(/o/gi, "\u25FC"))))
+            .join("");
     }
 
     function patchSend() {
@@ -477,6 +504,16 @@
                 }
             } catch (e) {
                 log.error("Reaction Spam: command check failed", e);
+            }
+            // Auto-censor: rewrite the text before it is sent.
+            try {
+                const text = args?.[1]?.content;
+                if (storage.censor && typeof text === "string") {
+                    const censored = censorText(text);
+                    if (censored !== text) return orig(args[0], { ...args[1], content: censored }, ...args.slice(2));
+                }
+            } catch (e) {
+                log.error("Reaction Spam: censor failed", e);
             }
             return orig(...args);
         }));
@@ -585,7 +622,7 @@
 
     function Settings() {
         useProxy(storage);
-        const { ScrollView, View, Text, TextInput, TouchableOpacity } = ReactNative;
+        const { ScrollView, View, Text, TextInput, TouchableOpacity, Switch } = ReactNative;
 
         const label = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
         const hint = { color: "#b5bac1", fontSize: 13, marginTop: 6 };
@@ -635,7 +672,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v12 (presets + chat commands)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v13 (presets, commands, censor)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -657,6 +694,22 @@
                     "Commands: \";flame @someone\" adds the closest-named preset's emojis to their latest message. " +
                     "\";undo 10\" removes your reactions from the last 10 messages, \";undo @someone\" from their latest reacted-to message. " +
                     "Your command shows in chat, changes to \"finished\", then is deleted 2 seconds later.")
+            ),
+            React.createElement(View, null,
+                React.createElement(View, { style: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" } },
+                    React.createElement(Text, { style: { ...label, marginBottom: 0 } }, "Auto-censor my messages"),
+                    React.createElement(Switch, { value: !!storage.censor, onValueChange: v => { storage.censor = v; } })
+                ),
+                React.createElement(TextInput, {
+                    style: { ...input, marginTop: 10 },
+                    value: storage.censorWords ?? "",
+                    placeholder: "job work working shower soap employed",
+                    placeholderTextColor: "#80848e",
+                    onChangeText: v => { storage.censorWords = v; }
+                }),
+                React.createElement(Text, { style: hint },
+                    "Words to censor, separated by spaces. Each \"o\" in them becomes \u25FC (Job -> J\u25FCb). " +
+                    "Also toggled in chat with \";censor\" and \";uncensor\".")
             ),
             ...presetCards,
             button("+ Add a new button", add, "#5865f2"),
@@ -693,6 +746,7 @@
                 });
             }
             storage.prefix ??= ";";
+            storage.censorWords ??= DEFAULT_CENSOR;
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
