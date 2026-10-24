@@ -1,7 +1,7 @@
 (() => {
     const { findByProps } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
-    const { before, after } = vendetta.patcher;
+    const { before, after, instead } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
@@ -142,6 +142,35 @@
         }
     }
 
+    // ---- Toast crash guard --------------------------------------------------------
+    // Discord's toast container crashes the whole app when it is handed a toast without a
+    // position ("Cannot read property 'position' of undefined"). Vendetta's showToast (used by
+    // many plugins) builds exactly that kind of toast, so block it before it reaches the UI.
+    function patchToastGuard() {
+        try {
+            const vdToasts = vendetta.ui.toasts;
+            if (vdToasts && typeof vdToasts.showToast === "function") {
+                unpatches.push(instead("showToast", vdToasts, () => {}));
+            }
+        } catch (e) {
+            log.error("Reaction Spam: couldn't guard Vendetta toasts", e);
+        }
+        try {
+            // Discord's own toast store: drop any toast that has no position anywhere.
+            const store = findByProps("open", "close", "getToasts") ?? findByProps("openToast");
+            const fn = store?.open ? "open" : store?.openToast ? "openToast" : null;
+            if (store && fn) {
+                unpatches.push(instead(fn, store, (args, orig) => {
+                    const t = args?.[0];
+                    if (t && typeof t === "object" && (t.position ?? t.options?.position) === undefined) return;
+                    return orig(...args);
+                }));
+            }
+        } catch (e) {
+            log.error("Reaction Spam: couldn't guard Discord toasts", e);
+        }
+    }
+
     // ---- Long-press menu ----------------------------------------------------------
 
     const isRow = el => el?.props && typeof el.props.label === "string" && typeof el.props.onPress === "function";
@@ -253,6 +282,7 @@
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
+            patchToastGuard();
             patchSheet();
         },
         onUnload() {
