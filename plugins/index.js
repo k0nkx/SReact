@@ -419,6 +419,7 @@
 
         const undoUser = body.match(/^\s*undo\s+<@!?(\d+)>\s*$/i);
         const undoCount = body.match(/^\s*undo(?:\s+(\d{1,3}))?\s*$/i);
+        const meCmd = body.match(/^\s*me\s+(\d{1,3})(?:\s+(silent|normal))?\s*$/i);
         const censorCmd = body.match(/^\s*(un)?censor\s*$/i);
         const spamCmd = body.match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
 
@@ -459,6 +460,10 @@
                 const result = await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
                 return result && result.sent > 0 ? "finished" : "failed";
             };
+        } else if (meCmd) {
+            const n = Math.min(500, Math.max(1, parseInt(meCmd[1], 10) || 1));
+            const mode = (meCmd[2] || (storage.silentDelete ? "silent" : "normal")).toLowerCase();
+            job = skipId => purgeMine(channelId, n, mode, skipId);
         } else if (censorCmd) {
             const on = !censorCmd[1];
             job = async () => {
@@ -492,6 +497,109 @@
             .split(/(```[\s\S]*?```|`[^`\n]*`|<[^>\s]+>|https?:\/\/\S+)/)
             .map((part, i) => (i % 2 ? part : part.replace(re, m => m.replace(/o/gi, "\u25FC"))))
             .join("");
+    }
+
+    // ---- Purge your own messages: ";me 10" ---------------------------------------
+    // Deletes your last N messages in the channel one by one. Single deletes have no age limit
+    // (only Discord's bulk delete does), so months-old messages go too.
+    //
+    // Silent delete (same trick as the SilentDelete plugin): post a short replacement message
+    // using the old message's ID as its nonce, so other people's message-logger caches get the
+    // replacement instead of your original text, then delete the replacement and the original.
+
+    const currentUserId = () => {
+        try {
+            UserStore ??= findByStoreName?.("UserStore");
+            return UserStore?.getCurrentUser?.()?.id ?? null;
+        } catch (e) {
+            return null;
+        }
+    };
+
+    // Retries a request a couple of times when Discord says "slow down" (429).
+    async function withRetry(fn, tries = 3) {
+        for (let i = 0; ; i++) {
+            try {
+                return await fn();
+            } catch (e) {
+                if (errorStatus(e) !== 429 || i >= tries - 1) throw e;
+                const wait = Number(e?.body?.retry_after ?? e?.retry_after ?? 1);
+                await sleep(Math.min(10, Number.isFinite(wait) ? wait : 1) * 1000 + 100);
+            }
+        }
+    }
+
+    // Your most recent messages in the channel (newest first), starting just before startBefore.
+    // Pages back through history 100 at a time, so old messages are reached too.
+    async function collectMyMessages(channelId, n, startBefore) {
+        const me = currentUserId();
+        if (!me) return [];
+        const found = [];
+        let before = startBefore;
+        for (let page = 0; page < 100 && found.length < n; page++) {
+            const query = { limit: 100 };
+            if (before) query.before = before;
+            const res = await withRetry(() => RestAPI.get({ url: `/channels/${channelId}/messages`, query }));
+            const batch = res?.body;
+            if (!Array.isArray(batch) || !batch.length) break;
+            for (const m of batch) {
+                if (m?.author?.id !== me) continue;
+                if (![0, 19, 20].includes(m.type ?? 0)) continue; // skip system messages
+                found.push(m);
+                if (found.length >= n) break;
+            }
+            before = batch[batch.length - 1].id; // oldest of this page
+            if (batch.length < 100) break;
+            await sleep(250);
+        }
+        return found;
+    }
+
+    const deleteMessage = (channelId, messageId) =>
+        withRetry(() => (RestAPI.del ?? RestAPI.delete).call(RestAPI, { url: `/channels/${channelId}/messages/${messageId}` }));
+
+    async function silentDeleteMessage(channelId, messageId) {
+        const res = await withRetry(() => RestAPI.post({
+            url: `/channels/${channelId}/messages`,
+            body: {
+                content: storage.replacementText || "** **",
+                flags: 4096, // no notification
+                mobile_network_type: "unknown",
+                nonce: messageId,
+                tts: false
+            }
+        }));
+        await sleep(200);
+        const replacementId = res?.body?.id;
+        if (replacementId) await deleteMessage(channelId, replacementId);
+        await sleep(100);
+        await deleteMessage(channelId, messageId);
+    }
+
+    // Deletes your last n messages. mode: "silent" | "normal". Returns the status text to show.
+    async function purgeMine(channelId, n, mode, skipId) {
+        const msgs = await collectMyMessages(channelId, n, skipId);
+        if (!msgs.length) return "nothing to delete";
+
+        const silent = mode === "silent";
+        const baseDelay = Math.max(0, parseInt(storage.delay, 10) || 0);
+        // Silent delete posts a message for each one, so go slower to stay under Discord's send limit.
+        const gap = silent ? Math.max(1500, baseDelay) : Math.max(300, baseDelay);
+        let deleted = 0;
+        for (const m of msgs) {
+            try {
+                if (silent) await silentDeleteMessage(channelId, m.id);
+                else await deleteMessage(channelId, m.id);
+                deleted++;
+            } catch (e) {
+                log.error("Reaction Spam: couldn't delete a message", m.id, e);
+                if (silent && errorStatus(e) === 403) break; // can't post here, so silent delete can't work
+            }
+            await sleep(gap);
+        }
+        storage.lastRun = `purge ${n} (${mode}): deleted ${deleted}/${msgs.length}`;
+        if (deleted === msgs.length) return "finished";
+        return deleted > 0 ? `finished (${deleted}/${msgs.length})` : "failed";
     }
 
     function patchSend() {
@@ -672,7 +780,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v13 (presets, commands, censor)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v14 (presets, commands, censor, purge)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -693,6 +801,7 @@
                 React.createElement(Text, { style: hint },
                     "Commands: \";flame @someone\" adds the closest-named preset's emojis to their latest message. " +
                     "\";undo 10\" removes your reactions from the last 10 messages, \";undo @someone\" from their latest reacted-to message. " +
+                    "\";me 10\" deletes your last 10 messages in that chat, however old. " +
                     "Your command shows in chat, changes to \"finished\", then is deleted 2 seconds later.")
             ),
             React.createElement(View, null,
@@ -710,6 +819,16 @@
                 React.createElement(Text, { style: hint },
                     "Words to censor, separated by spaces. Each \"o\" in them becomes \u25FC (Job -> J\u25FCb). " +
                     "Also toggled in chat with \";censor\" and \";uncensor\".")
+            ),
+            React.createElement(View, null,
+                React.createElement(View, { style: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" } },
+                    React.createElement(Text, { style: { ...label, marginBottom: 0 } }, "Silent delete for ;me"),
+                    React.createElement(Switch, { value: !!storage.silentDelete, onValueChange: v => { storage.silentDelete = v; } })
+                ),
+                React.createElement(Text, { style: hint },
+                    "Off = normal delete. On = silent delete: a short placeholder message is posted and removed for each " +
+                    "message so people's message loggers don't keep your original text. It's slower (about 1.5s each) and " +
+                    "briefly shows a blank message. Override per command with \";me 10 silent\" or \";me 10 normal\".")
             ),
             ...presetCards,
             button("+ Add a new button", add, "#5865f2"),
@@ -747,6 +866,7 @@
             }
             storage.prefix ??= ";";
             storage.censorWords ??= DEFAULT_CENSOR;
+            storage.silentDelete ??= false;
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
