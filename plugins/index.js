@@ -248,6 +248,7 @@
         };
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
+            React.createElement(Text, { style: hint }, "Reaction Spam v3 (no toasts, cap 19)"),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Emojis (max 19)"),
                 React.createElement(TextInput, {
