@@ -1,24 +1,18 @@
 (() => {
     const { findByProps } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
-    const { before, after, instead } = vendetta.patcher;
+    const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
+    const { showToast } = vendetta.ui.toasts;
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
     const { useProxy } = vendetta.storage;
     const log = vendetta.logger;
 
-    // Discord's own toast container crashes ("Cannot read property 'position' of undefined"),
-    // so use the native Android toast instead. Falls back to an alert on other platforms.
-    // v3: no toasts at all. The run just finishes silently; status goes to the debug logs.
-    const showToast = msg => {
-        try { log.info("Reaction Spam: " + String(msg ?? "")); } catch (e) {}
-    };
-
     const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet;
+    let RestAPI, ActionSheet, ReactionActions;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
@@ -35,42 +29,11 @@
         const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
         for (const t of tokens) {
             const custom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
-            // Unicode emojis typed with no spaces between them ("😂💀🔥") are split apart here.
-            const keys = custom ? [`${custom[1]}:${custom[2]}`] : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
-            for (const key of keys) {
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push(key);
-                if (out.length >= MAX_REACTIONS) return out;
-            }
-        }
-        return out;
-    }
-
-    // Splits a run of emojis into individual emojis, keeping skin tones, ZWJ sequences,
-    // variation selectors, keycaps and flags together.
-    function splitEmoji(str) {
-        const cps = Array.from(str);
-        const isMod = c => {
-            const n = c.codePointAt(0);
-            return n === 0xFE0F || n === 0xFE0E || n === 0x20E3
-                || (n >= 0x1F3FB && n <= 0x1F3FF) || (n >= 0xE0020 && n <= 0xE007F);
-        };
-        const isFlag = c => {
-            const n = c.codePointAt(0);
-            return n >= 0x1F1E6 && n <= 0x1F1FF;
-        };
-        const out = [];
-        let i = 0;
-        while (i < cps.length) {
-            let g = cps[i++];
-            if (isFlag(g) && i < cps.length && isFlag(cps[i])) g += cps[i++];
-            while (i < cps.length) {
-                if (isMod(cps[i])) g += cps[i++];
-                else if (cps[i] === "\u200D" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
-                else break;
-            }
-            out.push(g);
+            const key = custom ? `${custom[1]}:${custom[2]}` : t;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(key);
+            if (out.length >= MAX_REACTIONS) break;
         }
         return out;
     }
@@ -94,6 +57,17 @@
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
     }
 
+    // Fallback: Discord's own reaction action, used only if the raw REST call fails.
+    function toEmojiObject(key) {
+        const m = key.match(/^(\w+):(\d+)$/);
+        return m ? { id: m[2], name: m[1], animated: false } : { id: null, name: key, animated: false };
+    }
+
+    async function addReactionFallback(channelId, messageId, key) {
+        if (!ReactionActions?.addReaction) throw new Error("no fallback available");
+        await ReactionActions.addReaction(channelId, messageId, toEmojiObject(key), "Message Reaction Picker");
+    }
+
     async function spam(message) {
         if (running) return showToast("Reaction spam already running");
         if (!RestAPI?.put) return showToast("Couldn't find Discord's REST API");
@@ -112,7 +86,14 @@
             for (const emoji of emojis) {
                 if (cancelled) break;
                 try {
-                    await addReaction(message.channel_id, message.id, emoji);
+                    try {
+                        await addReaction(message.channel_id, message.id, emoji);
+                    } catch (e) {
+                        const status = errorStatus(e);
+                        if (status === 429 || status === 401 || status === 403) throw e;
+                        log.error("Reaction Spam: REST add failed, trying fallback", emoji, e);
+                        await addReactionFallback(message.channel_id, message.id, emoji).catch(() => { throw e; });
+                    }
                     sent++;
                 } catch (e) {
                     const status = errorStatus(e);
@@ -133,41 +114,12 @@
             }
             if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
             else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            else showToast(`Added ${sent}/${emojis.length} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
+            else showToast(`Added ${sent} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
         } finally {
             running = false;
-        }
-    }
-
-    // ---- Toast crash guard --------------------------------------------------------
-    // Discord's toast container crashes the whole app when it is handed a toast without a
-    // position ("Cannot read property 'position' of undefined"). Vendetta's showToast (used by
-    // many plugins) builds exactly that kind of toast, so block it before it reaches the UI.
-    function patchToastGuard() {
-        try {
-            const vdToasts = vendetta.ui.toasts;
-            if (vdToasts && typeof vdToasts.showToast === "function") {
-                unpatches.push(instead("showToast", vdToasts, () => {}));
-            }
-        } catch (e) {
-            log.error("Reaction Spam: couldn't guard Vendetta toasts", e);
-        }
-        try {
-            // Discord's own toast store: drop any toast that has no position anywhere.
-            const store = findByProps("open", "close", "getToasts") ?? findByProps("openToast");
-            const fn = store?.open ? "open" : store?.openToast ? "openToast" : null;
-            if (store && fn) {
-                unpatches.push(instead(fn, store, (args, orig) => {
-                    const t = args?.[0];
-                    if (t && typeof t === "object" && (t.position ?? t.options?.position) === undefined) return;
-                    return orig(...args);
-                }));
-            }
-        } catch (e) {
-            log.error("Reaction Spam: couldn't guard Discord toasts", e);
         }
     }
 
@@ -282,7 +234,7 @@
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
-            patchToastGuard();
+            ReactionActions = findByProps("addReaction", "removeReaction") ?? findByProps("addReaction");
             patchSheet();
         },
         onUnload() {
