@@ -208,17 +208,18 @@
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
     }
 
-    async function spam(message) {
+    async function spam(message, preset) {
         if (running) return showToast("Reaction spam already running");
         if (!RestAPI?.put) return showToast("Couldn't find Discord's REST API");
+        if (!preset) return showToast("That preset no longer exists");
 
-        let emojis = parseEmojis(storage.emojis);
+        let emojis = parseEmojis(preset.emojis);
         if (missingShortcodes.length) {
             // The emoji store didn't know some :names:, so ask Discord's API and parse again.
             await loadRestEmojis();
-            emojis = parseEmojis(storage.emojis);
+            emojis = parseEmojis(preset.emojis);
         }
-        if (!emojis.length) return showToast("Add some emojis in the plugin settings first");
+        if (!emojis.length) return showToast("Add some emojis to this preset in the plugin settings first");
 
         const delay = Math.max(0, parseInt(storage.delay, 10) || 0);
         running = true;
@@ -305,24 +306,29 @@
 
     function addRow(tree, message) {
         const rows = findInReactTree(tree, x => Array.isArray(x) && x.some(isRow));
-        if (!rows || rows.some(r => r?.key === "reaction-spam")) return;
+        if (!rows || rows.some(r => typeof r?.key === "string" && r.key.startsWith("reaction-spam"))) return;
         const template = rows.find(isRow);
+        const icons = ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"];
+        const hide = () => ActionSheet?.hideActionSheet?.();
 
-        rows.push(makeRow(
-            template,
-            "reaction-spam",
-            running ? "Stop Reaction Spam" : "Spam Reactions",
-            ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"],
-            () => {
-                ActionSheet?.hideActionSheet?.();
-                if (running) {
-                    cancelled = true;
-                    showToast("Stopping...");
-                } else {
-                    spam(message);
-                }
-            }
-        ));
+        // While a run is going, the only button is Stop.
+        if (running) {
+            rows.push(makeRow(template, "reaction-spam-stop", "Stop Reaction Spam", icons, () => {
+                hide();
+                cancelled = true;
+                showToast("Stopping...");
+            }));
+            return;
+        }
+
+        // One menu button per preset.
+        for (const preset of storage.presets ?? []) {
+            const id = preset.id;
+            rows.push(makeRow(template, `reaction-spam-${id}`, preset.name || "Spam Reactions", icons, () => {
+                hide();
+                spam(message, (storage.presets ?? []).find(p => p.id === id));
+            }));
+        }
     }
 
     function patchSheet() {
@@ -349,9 +355,12 @@
 
     // ---- Settings -----------------------------------------------------------------
 
+    const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const plain = p => ({ id: p.id, name: p.name, emojis: p.emojis });
+
     function Settings() {
         useProxy(storage);
-        const { ScrollView, View, Text, TextInput } = ReactNative;
+        const { ScrollView, View, Text, TextInput, TouchableOpacity } = ReactNative;
 
         const label = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
         const hint = { color: "#b5bac1", fontSize: 13, marginTop: 6 };
@@ -363,26 +372,54 @@
             paddingVertical: 10,
             fontSize: 16
         };
+        const card = { backgroundColor: "#2b2d31", borderRadius: 12, padding: 14, gap: 12 };
 
-        return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v7 (custom emojis first)"),
-            React.createElement(Text, { style: hint }, (() => {
-                try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
-            })()),
+        const presets = (Array.isArray(storage.presets) ? storage.presets : []).map(plain);
+        const update = (id, patch) => { storage.presets = presets.map(p => p.id === id ? { ...p, ...patch } : p); };
+        const remove = id => { storage.presets = presets.filter(p => p.id !== id); };
+        const add = () => { storage.presets = [...presets, { id: newId(), name: "New preset", emojis: "" }]; };
+
+        const button = (text, onPress, color) => React.createElement(TouchableOpacity, {
+            onPress,
+            style: { backgroundColor: color, borderRadius: 8, paddingVertical: 10, alignItems: "center" }
+        }, React.createElement(Text, { style: { color: "#ffffff", fontWeight: "600", fontSize: 15 } }, text));
+
+        const presetCards = presets.map(p => React.createElement(View, { key: p.id, style: card },
+            React.createElement(View, null,
+                React.createElement(Text, { style: label }, "Button name"),
+                React.createElement(TextInput, {
+                    style: input,
+                    value: p.name ?? "",
+                    placeholder: "e.g. Flame Skull",
+                    placeholderTextColor: "#80848e",
+                    onChangeText: v => update(p.id, { name: v })
+                })
+            ),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Emojis (max 19)"),
                 React.createElement(TextInput, {
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
-                    value: storage.emojis ?? "",
-                    placeholder: "😂 💀 🔥  or  <:name:id>",
+                    value: p.emojis ?? "",
+                    placeholder: "😂 💀 🔥  or  :skullcry:  or  <:name:id>",
                     placeholderTextColor: "#80848e",
-                    onChangeText: v => { storage.emojis = v; }
-                }),
-                React.createElement(Text, { style: hint },
-                    "Separate with spaces or commas. Custom server emojis: :name: (e.g. :skullcry:), <:name:id> or name:id. " +
-                    "Discord only allows 20 unique reactions per message, so duplicates are removed and the list is capped at 19 to avoid the limit.")
+                    onChangeText: v => update(p.id, { emojis: v })
+                })
             ),
+            button("Delete this button", () => remove(p.id), "#da373c")
+        ));
+
+        return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
+            React.createElement(Text, { style: hint }, "Reaction Spam v8 (presets)"),
+            React.createElement(Text, { style: hint }, (() => {
+                try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
+            })()),
+            React.createElement(Text, { style: hint },
+                "Each preset below becomes its own button when you long press a message. " +
+                "Use spaces or commas between emojis. Custom server emojis: :name: (e.g. :skullcry:), <:name:id> or name:id. " +
+                "Discord allows 20 unique reactions per message, so each preset is capped at 19."),
+            ...presetCards,
+            button("+ Add a new button", add, "#5865f2"),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Delay between reactions (ms)"),
                 React.createElement(TextInput, {
@@ -394,14 +431,17 @@
                     onChangeText: v => { storage.delay = v.replace(/[^0-9]/g, ""); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Long press a message and tap Spam Reactions. It stops straight away on a 429. Raise the delay if you keep hitting it.")
+                    "Applies to every button. It stops straight away on a 429. Raise the delay if you keep hitting it.")
             )
         );
     }
 
     return {
         onLoad() {
-            storage.emojis ??= DEFAULT_EMOJIS;
+            if (!Array.isArray(storage.presets)) {
+                // First run on this version: your old emoji list becomes the first button.
+                storage.presets = [{ id: "default", name: "Spam Reactions", emojis: storage.emojis ?? DEFAULT_EMOJIS }];
+            }
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
