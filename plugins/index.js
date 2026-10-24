@@ -149,11 +149,16 @@
             for (const key of keys) {
                 if (!key || seen.has(key)) continue;
                 seen.add(key);
-                out.push(key);
-                if (out.length >= MAX_REACTIONS) return out;
+                out.push({ key, isCustom: !!(custom || short) });
             }
         }
-        return out;
+        // Over the reaction limit: custom emojis win, the rest fill whatever room is left.
+        // Without this, a long default list would push your custom emojis past the cap.
+        if (out.length > MAX_REACTIONS) {
+            let room = MAX_REACTIONS - out.filter(o => o.isCustom).length;
+            return out.filter(o => o.isCustom || room-- > 0).slice(0, MAX_REACTIONS).map(o => o.key);
+        }
+        return out.map(o => o.key);
     }
 
     // Splits a run of emojis into individual emojis, keeping skin tones, ZWJ sequences,
@@ -360,7 +365,7 @@
         };
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v6 (no toasts, cap 19, :name: emojis + API fallback)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v7 (custom emojis first)"),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
             })()),
