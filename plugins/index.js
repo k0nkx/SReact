@@ -1,9 +1,8 @@
 (() => {
     const { findByProps } = vendetta.metro;
-    const { React, ReactNative } = vendetta.metro.common;
+    const { React, ReactNative, toasts } = vendetta.metro.common;
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
-    const { showToast } = vendetta.ui.toasts;
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
     const { useProxy } = vendetta.storage;
@@ -12,13 +11,45 @@
     const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet, ReactionActions;
+    let RestAPI, ActionSheet, ReactionActions, uuid4;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
     let cancelled = false;
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    // Safe toast that works after Discord's toast API change
+    function showToast(content, asset) {
+        try {
+            // Prefer Kettu / Vendetta's wrapper if it exists and is healthy
+            const vdShow = vendetta?.ui?.toasts?.showToast;
+            if (typeof vdShow === "function") {
+                return vdShow(content, asset);
+            }
+        } catch {}
+
+        // Fallback: call Discord's toasts.open the same way modern Kettu does
+        try {
+            if (!uuid4) {
+                uuid4 = findByProps("uuid4")?.uuid4;
+            }
+            if (toasts?.open) {
+                toasts.open({
+                    key: `reactions-toast-${uuid4 ? uuid4() : Date.now()}`,
+                    content,
+                    source: asset,
+                    icon: asset,
+                });
+                return;
+            }
+        } catch (e) {
+            log.error("Reaction Spam: toast failed", e);
+        }
+
+        // Last resort
+        console.log("[Reactions]", content);
+    }
 
     // ---- Emoji parsing ------------------------------------------------------------
 
@@ -118,9 +149,14 @@
                 }
                 if (delay) await sleep(delay);
             }
-            if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
-            else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            else showToast(`Added \( {sent} reaction(s) \){failed ? `, \( {failed} failed ( \){errorText(lastError)})` : ""}`);
+            if (cancelled) {
+                showToast(`Stopped after ${sent} reaction(s)`);
+            } else if (!sent && lastError) {
+                showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
+            } else {
+                const extra = failed ? `, \( {failed} failed ( \){errorText(lastError)})` : "";
+                showToast(`Added \( {sent} reaction(s) \){extra}`);
+            }
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
@@ -137,8 +173,11 @@
         const props = { key, label, onPress };
         const iconId = iconNames.map(n => getAssetIDByName?.(n)).find(Boolean);
         const icon = template.props.icon;
-        if (iconId && React.isValidElement(icon)) props.icon = React.cloneElement(icon, { source: iconId });
-        else if (iconId && typeof icon === "number") props.icon = iconId;
+        if (iconId && React.isValidElement(icon)) {
+            props.icon = React.cloneElement(icon, { source: iconId });
+        } else if (iconId && typeof icon === "number") {
+            props.icon = iconId;
+        }
         return React.cloneElement(template, props);
     }
 
@@ -146,6 +185,7 @@
         const rows = findInReactTree(tree, x => Array.isArray(x) && x.some(isRow));
         if (!rows || rows.some(r => r?.key === "reaction-spam")) return;
         const template = rows.find(isRow);
+        if (!template) return;
 
         rows.push(makeRow(
             template,
@@ -166,15 +206,24 @@
 
     function patchSheet() {
         ActionSheet = findByProps("openLazy", "hideActionSheet");
-        if (!ActionSheet) return log.error("Reaction Spam: couldn't find the action sheet module");
+        if (!ActionSheet) {
+            log.error("Reaction Spam: couldn't find the action sheet module");
+            return;
+        }
 
         unpatches.push(before("openLazy", ActionSheet, ([lazy, key]) => {
             if (unpatchSheet || typeof key !== "string" || !key.includes("MessageLongPress")) return;
             Promise.resolve(lazy).then(mod => {
                 if (unpatchSheet || !mod) return;
-                const [target, prop] = typeof mod.default === "function" ? [mod, "default"]
-                    : typeof mod.default?.type === "function" ? [mod.default, "type"] : [];
-                if (!target) return log.error("Reaction Spam: unexpected message menu shape");
+                const [target, prop] = typeof mod.default === "function"
+                    ? [mod, "default"]
+                    : typeof mod.default?.type === "function"
+                        ? [mod.default, "type"]
+                        : [];
+                if (!target) {
+                    log.error("Reaction Spam: unexpected message menu shape");
+                    return;
+                }
                 unpatchSheet = after(prop, target, ([props], tree) => {
                     try {
                         if (props?.message?.id) addRow(tree, props.message);
@@ -238,9 +287,12 @@
         onLoad() {
             storage.emojis ??= DEFAULT_EMOJIS;
             storage.delay ??= "400";
+
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
+
             ReactionActions = findByProps("addReaction", "removeReaction") ?? findByProps("addReaction");
+
             patchSheet();
         },
         onUnload() {
@@ -251,4 +303,4 @@
         },
         settings: Settings
     };
-})()
+})();
