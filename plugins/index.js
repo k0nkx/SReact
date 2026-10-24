@@ -15,12 +15,10 @@
         try { log.info("Reaction Spam: " + String(msg ?? "")); } catch (e) {}
     };
 
-    // Discord's hard limit is 20 unique reactions per message. Hitting it makes Discord itself
-    // pop its (broken) "max reactions" toast and crash, so stay one under the limit.
-    const MAX_REACTIONS = 20;
+    const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet;
+    let RestAPI, ActionSheet, MessageActions, MessageStore;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
@@ -264,6 +262,105 @@
         }
     }
 
+    // ---- Chat command: ";flame @someone" ------------------------------------------
+    // Type the prefix, a preset name (it doesn't have to be exact) and an @mention. The message
+    // isn't sent; instead that preset's emojis are added to the mentioned person's latest
+    // message in the channel you typed it in.
+
+    const norm = str => String(str ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    function similarity(a, b) {
+        if (!a.length || !b.length) return 0;
+        let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+        for (let i = 1; i <= a.length; i++) {
+            const cur = [i];
+            for (let j = 1; j <= b.length; j++) {
+                cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+            }
+            prev = cur;
+        }
+        return 1 - prev[b.length] / Math.max(a.length, b.length);
+    }
+
+    // Picks the preset whose name is closest to what was typed (exact > prefix > contains > typo).
+    function findClosestPreset(query) {
+        const q = norm(query);
+        if (!q) return null;
+        let best = null;
+        let bestScore = 0;
+        for (const raw of storage.presets ?? []) {
+            const preset = plain(raw);
+            const n = norm(preset.name);
+            if (!n) continue;
+            const score = n === q ? 1
+                : (n.startsWith(q) || q.startsWith(n)) ? 0.9
+                : (n.includes(q) || q.includes(n)) ? 0.75
+                : similarity(n, q);
+            if (score > bestScore) { best = preset; bestScore = score; }
+        }
+        return bestScore >= 0.5 ? best : null;
+    }
+
+    // Newest message from that user in the channel: loaded messages first, then the API.
+    async function findLatestMessage(channelId, userId) {
+        try {
+            MessageStore ??= findByStoreName?.("MessageStore");
+            const col = MessageStore?.getMessages?.(channelId);
+            const arr = col?.toArray?.() ?? col?._array ?? [];
+            for (let i = arr.length - 1; i >= 0; i--) {
+                if (arr[i]?.author?.id === userId) return arr[i];
+            }
+        } catch (e) {
+            log.error("Reaction Spam: message store lookup failed", e);
+        }
+        try {
+            const res = await RestAPI.get({ url: `/channels/${channelId}/messages`, query: { limit: 100 } });
+            return (res?.body ?? []).find(m => m?.author?.id === userId) ?? null; // newest first
+        } catch (e) {
+            log.error("Reaction Spam: couldn't fetch recent messages", e);
+        }
+        return null;
+    }
+
+    // Returns true if the text was a command (so the message shouldn't be sent).
+    function handleCommand(channelId, content) {
+        const prefix = storage.prefix || ";";
+        if (typeof content !== "string" || !content.startsWith(prefix)) return false;
+        const m = content.slice(prefix.length).match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
+        if (!m) return false;
+
+        const [, query, userId] = m;
+        const preset = findClosestPreset(query);
+        if (!preset) {
+            storage.lastRun = `Command "${query.trim()}": no preset with a similar name`;
+            return true;
+        }
+        (async () => {
+            const target = await findLatestMessage(channelId, userId);
+            if (!target) {
+                storage.lastRun = `${preset.name}: couldn't find a recent message from that person`;
+                return;
+            }
+            await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
+        })().catch(e => log.error("Reaction Spam: command failed", e));
+        return true;
+    }
+
+    function patchSend() {
+        MessageActions = findByProps("sendMessage", "receiveMessage");
+        if (!MessageActions) return log.error("Reaction Spam: couldn't find the message sender, chat command disabled");
+        unpatches.push(instead("sendMessage", MessageActions, (args, orig) => {
+            try {
+                if (handleCommand(args?.[0], args?.[1]?.content)) {
+                    return Promise.resolve({ ok: true, status: 200, body: {} });
+                }
+            } catch (e) {
+                log.error("Reaction Spam: command check failed", e);
+            }
+            return orig(...args);
+        }));
+    }
+
     // ---- Toast crash guard --------------------------------------------------------
     // Discord's toast container crashes the whole app when it is handed a toast without a
     // position ("Cannot read property 'position' of undefined"). Vendetta's showToast (used by
@@ -403,7 +500,7 @@
                 })
             ),
             React.createElement(View, null,
-                React.createElement(Text, { style: label }, "Emojis (max 19)"),
+                React.createElement(Text, { style: label }, "Emojis (max 20)"),
                 React.createElement(TextInput, {
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
@@ -417,7 +514,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v10 (presets)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v11 (presets + chat command)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -425,7 +522,20 @@
             React.createElement(Text, { style: hint },
                 "Each preset below becomes its own button when you long press a message. " +
                 "Use spaces or commas between emojis. Custom server emojis: :name: (e.g. :skullcry:), <:name:id> or name:id. " +
-                "Discord allows 20 unique reactions per message, so each preset is capped at 19."),
+                "Discord allows 20 unique reactions per message, so each preset is capped at 20."),
+            React.createElement(View, null,
+                React.createElement(Text, { style: label }, "Chat command prefix"),
+                React.createElement(TextInput, {
+                    style: input,
+                    value: storage.prefix ?? "",
+                    placeholder: ";",
+                    placeholderTextColor: "#80848e",
+                    onChangeText: v => { storage.prefix = v.trim(); }
+                }),
+                React.createElement(Text, { style: hint },
+                    "Type e.g. \";flame @someone\" in any chat. It finds the preset with the closest name, " +
+                    "adds its emojis to that person's latest message, and doesn't send your text.")
+            ),
             ...presetCards,
             button("+ Add a new button", add, "#5865f2"),
             React.createElement(View, null,
@@ -460,11 +570,13 @@
                     return { ...pr, id };
                 });
             }
+            storage.prefix ??= ";";
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
             patchToastGuard();
             patchSheet();
+            patchSend();
         },
         onUnload() {
             cancelled = true;
