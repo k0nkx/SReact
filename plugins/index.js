@@ -9,7 +9,7 @@
     const { useProxy } = vendetta.storage;
     const log = vendetta.logger;
 
-    const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
+    const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
     let RestAPI, ActionSheet, ReactionActions;
@@ -22,17 +22,23 @@
 
     // ---- Emoji parsing ------------------------------------------------------------
 
-    // Accepts unicode emojis, <:name:id>, <a:name:id> or name:id, split on spaces/commas.
+    // Returns { apiKey, animated }  apiKey is what goes in the URL (name:id or unicode)
     function parseEmojis(raw) {
         const out = [];
         const seen = new Set();
         const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
         for (const t of tokens) {
-            const custom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
-            const key = custom ? `${custom[1]}:${custom[2]}` : t;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            out.push(key);
+            const m = t.match(/^<?(a)?:?(\w+):(\d+)>?$/);
+            let apiKey, animated = false;
+            if (m) {
+                animated = !!m[1];
+                apiKey = `\( {m[2]}: \){m[3]}`;
+            } else {
+                apiKey = t;
+            }
+            if (seen.has(apiKey)) continue;
+            seen.add(apiKey);
+            out.push({ apiKey, animated });
             if (out.length >= MAX_REACTIONS) break;
         }
         return out;
@@ -40,9 +46,9 @@
 
     // ---- Reacting -----------------------------------------------------------------
 
-    function addReaction(channelId, messageId, emoji) {
+    function addReaction(channelId, messageId, apiKey) {
         return RestAPI.put({
-            url: `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+            url: `/channels/\( {channelId}/messages/ \){messageId}/reactions/${encodeURIComponent(apiKey)}/@me`,
             query: { location: "Message Reaction Picker", type: 0 }
         });
     }
@@ -57,15 +63,16 @@
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
     }
 
-    // Fallback: Discord's own reaction action, used only if the raw REST call fails.
-    function toEmojiObject(key) {
-        const m = key.match(/^(\w+):(\d+)$/);
-        return m ? { id: m[2], name: m[1], animated: false } : { id: null, name: key, animated: false };
+    function toEmojiObject(apiKey, animated) {
+        const m = apiKey.match(/^(\w+):(\d+)$/);
+        return m
+            ? { id: m[2], name: m[1], animated: !!animated }
+            : { id: null, name: apiKey, animated: false };
     }
 
-    async function addReactionFallback(channelId, messageId, key) {
+    async function addReactionFallback(channelId, messageId, apiKey, animated) {
         if (!ReactionActions?.addReaction) throw new Error("no fallback available");
-        await ReactionActions.addReaction(channelId, messageId, toEmojiObject(key), "Message Reaction Picker");
+        await ReactionActions.addReaction(channelId, messageId, toEmojiObject(apiKey, animated), "Message Reaction Picker");
     }
 
     async function spam(message) {
@@ -83,16 +90,16 @@
         let lastError = null;
 
         try {
-            for (const emoji of emojis) {
+            for (const { apiKey, animated } of emojis) {
                 if (cancelled) break;
                 try {
                     try {
-                        await addReaction(message.channel_id, message.id, emoji);
+                        await addReaction(message.channel_id, message.id, apiKey);
                     } catch (e) {
                         const status = errorStatus(e);
                         if (status === 429 || status === 401 || status === 403) throw e;
-                        log.error("Reaction Spam: REST add failed, trying fallback", emoji, e);
-                        await addReactionFallback(message.channel_id, message.id, emoji).catch(() => { throw e; });
+                        log.error("Reaction Spam: REST add failed, trying fallback", apiKey, e);
+                        await addReactionFallback(message.channel_id, message.id, apiKey, animated).catch(() => { throw e; });
                     }
                     sent++;
                 } catch (e) {
@@ -105,16 +112,15 @@
                         showToast(`No permission to react (${status}), stopped`);
                         return;
                     }
-                    // Bad emoji or some other per-emoji failure: skip it and carry on.
                     failed++;
                     lastError = e;
-                    log.error("Reaction Spam: failed to add", emoji, e);
+                    log.error("Reaction Spam: failed to add", apiKey, e);
                 }
                 if (delay) await sleep(delay);
             }
             if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
             else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            else showToast(`Added ${sent} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
+            else showToast(`Added \( {sent} reaction(s) \){failed ? `, \( {failed} failed ( \){errorText(lastError)})` : ""}`);
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
@@ -204,13 +210,13 @@
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
                     value: storage.emojis ?? "",
-                    placeholder: "😂 💀 🔥  or  <:name:id>",
+                    placeholder: "😂 💀 🔥  or  <:name:id>  or  <a:name:id>",
                     placeholderTextColor: "#80848e",
                     onChangeText: v => { storage.emojis = v; }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Separate with spaces or commas. Custom emojis: <:name:id> or name:id. " +
-                    "Discord only allows 20 unique reactions per message, so duplicates are removed and the list is capped at 20.")
+                    "Separate with spaces or commas. Custom: <:name:id> or <a:name:id> or name:id. " +
+                    "Discord only allows 20 unique reactions per message.")
             ),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Delay between reactions (ms)"),
@@ -223,7 +229,7 @@
                     onChangeText: v => { storage.delay = v.replace(/[^0-9]/g, ""); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Long press a message and tap Spam Reactions. It stops straight away on a 429. Raise the delay if you keep hitting it.")
+                    "Long press a message and tap Spam Reactions. It stops on 429. Raise the delay if needed.")
             )
         );
     }
