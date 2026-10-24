@@ -31,26 +31,89 @@
     // ---- Emoji parsing ------------------------------------------------------------
 
     // Looks up custom server emojis by name (for ":skullcry:" style input) using Discord's emoji store.
-    let EmojiStore;
+    let EmojiStore, GuildStore;
+    const restEmojis = [];              // emojis fetched straight from Discord's API as a fallback
+    const restFetchedGuilds = new Set();
+    const missingShortcodes = [];       // :names: the last parse couldn't resolve
+
+    // Fallback: if the emoji store doesn't know a :name:, ask Discord's API for the emojis of
+    // the servers you're in until every missing name has been found.
+    async function loadRestEmojis() {
+        if (!RestAPI?.get) return;
+        const wanted = missingShortcodes.map(n => n.toLowerCase());
+        const found = () => wanted.every(n => restEmojis.some(e => e.name.toLowerCase() === n));
+        try {
+            const res = await RestAPI.get({ url: "/users/@me/guilds" });
+            for (const g of res?.body ?? []) {
+                if (found()) break;
+                if (!g?.id || restFetchedGuilds.has(g.id)) continue;
+                restFetchedGuilds.add(g.id);
+                try {
+                    const r = await RestAPI.get({ url: `/guilds/${g.id}/emojis` });
+                    for (const e of r?.body ?? []) {
+                        if (typeof e?.id === "string" && typeof e?.name === "string") restEmojis.push(e);
+                    }
+                } catch (e) {
+                    log.error("Reaction Spam: couldn't load emojis for a server", e);
+                }
+                await sleep(100);
+            }
+        } catch (e) {
+            log.error("Reaction Spam: couldn't load your servers' emojis", e);
+        }
+    }
+
+    // Emoji objects have these fields; guilds/roles/users do not (they have ownerId etc.).
+    const isEmoji = e => e && typeof e === "object" && typeof e.id === "string" && typeof e.name === "string"
+        && !("ownerId" in e) && ("animated" in e || "guildId" in e || "require_colons" in e || "allNamesString" in e);
+
     function customEmojiList() {
         const list = [];
-        const push = e => { if (e && typeof e.id === "string" && typeof e.name === "string") list.push(e); };
-        const eachOf = c => c instanceof Map ? [...c.values()] : Array.isArray(c) ? c : Object.values(c ?? {});
+        const seenIds = new Set();
+        let visited = 0;
+        // Walk arrays/Maps/plain objects a couple of levels deep and collect anything emoji-shaped.
+        const collect = (v, depth) => {
+            if (!v || typeof v !== "object" || visited++ > 20000) return;
+            if (isEmoji(v)) {
+                if (!seenIds.has(v.id)) { seenIds.add(v.id); list.push(v); }
+                return;
+            }
+            if (depth <= 0) return;
+            const items = v instanceof Map ? [...v.values()] : Array.isArray(v) ? v : Object.values(v);
+            for (const it of items) collect(it, depth - 1);
+        };
+        const attempt = fn => { try { collect(fn(), 3); } catch (e) { /* try the next source */ } };
+
         try {
             EmojiStore ??= findByStoreName?.("EmojiStore") ?? findByProps("getCustomEmojiById", "getGuilds");
-            const store = EmojiStore;
-            if (!store) return list;
-            try {
-                eachOf(store.getGuilds?.()).forEach(g => eachOf(g?.emojis ?? g?.getEmojis?.()).forEach(push));
-            } catch (e) { /* try the next source */ }
-            try {
-                eachOf(store.getDisambiguatedEmojiContext?.()?.customEmojis).forEach(push);
-            } catch (e) { /* try the next source */ }
-            try {
-                eachOf(store.getUsableCustomEmojis?.()).forEach(push);
-            } catch (e) { /* ignore */ }
+            GuildStore ??= findByStoreName?.("GuildStore");
+            const es = EmojiStore;
+            if (es) {
+                attempt(() => es.getGuilds?.());
+                attempt(() => es.getDisambiguatedEmojiContext?.()?.customEmojis);
+                attempt(() => es.getUsableCustomEmojis?.());
+                attempt(() => es.getCustomEmojis?.());
+                // Per-guild lookups over every guild the user is in.
+                try {
+                    const guilds = GuildStore?.getGuilds?.() ?? {};
+                    for (const id of Object.keys(guilds)) {
+                        attempt(() => es.getGuildEmoji?.(id));
+                        attempt(() => guilds[id]?.emojis);
+                    }
+                } catch (e) { /* ignore */ }
+                // Last resort: call every zero-argument getter on the store and look for emojis.
+                if (!list.length) {
+                    const names = new Set([...Object.getOwnPropertyNames(es), ...Object.getOwnPropertyNames(Object.getPrototypeOf(es) ?? {})]);
+                    for (const n of names) {
+                        if (/^get/.test(n) && typeof es[n] === "function" && es[n].length === 0) attempt(() => es[n]());
+                    }
+                }
+            }
         } catch (e) {
             log.error("Reaction Spam: couldn't read the emoji store", e);
+        }
+        for (const e of restEmojis) {
+            if (!seenIds.has(e.id)) { seenIds.add(e.id); list.push(e); }
         }
         // Emojis the user can actually use come first.
         return list.sort((a, b) => (b.available !== false) - (a.available !== false));
@@ -60,7 +123,10 @@
         const list = getList();
         const lower = name.toLowerCase();
         const hit = list.find(e => e.name === name) ?? list.find(e => e.name.toLowerCase() === lower);
-        if (!hit) log.error(`Reaction Spam: no custom emoji named :${name}:`);
+        if (!hit) {
+            if (!missingShortcodes.includes(name)) missingShortcodes.push(name);
+            log.error(`Reaction Spam: no custom emoji named :${name}: (yet)`);
+        }
         return hit ? `${hit.name}:${hit.id}` : null;
     }
 
@@ -70,6 +136,7 @@
         const out = [];
         const seen = new Set();
         let cache;
+        missingShortcodes.length = 0;
         const getList = () => (cache ??= customEmojiList());
         const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
         for (const t of tokens) {
@@ -140,7 +207,12 @@
         if (running) return showToast("Reaction spam already running");
         if (!RestAPI?.put) return showToast("Couldn't find Discord's REST API");
 
-        const emojis = parseEmojis(storage.emojis);
+        let emojis = parseEmojis(storage.emojis);
+        if (missingShortcodes.length) {
+            // The emoji store didn't know some :names:, so ask Discord's API and parse again.
+            await loadRestEmojis();
+            emojis = parseEmojis(storage.emojis);
+        }
         if (!emojis.length) return showToast("Add some emojis in the plugin settings first");
 
         const delay = Math.max(0, parseInt(storage.delay, 10) || 0);
@@ -288,7 +360,10 @@
         };
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v4 (no toasts, cap 19, :name: emojis)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v6 (no toasts, cap 19, :name: emojis + API fallback)"),
+            React.createElement(Text, { style: hint }, (() => {
+                try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
+            })()),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Emojis (max 19)"),
                 React.createElement(TextInput, {
