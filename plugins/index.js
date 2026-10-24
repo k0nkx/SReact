@@ -1,10 +1,9 @@
 (() => {
-    const { findByProps } = vendetta.metro;
+    const { findByProps, findByStoreName } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
     const { showToast: rawToast } = vendetta.ui.toasts;
-    // Always hand Discord a short plain string so a long or odd message can't break the toast.
     const showToast = msg => {
         try { rawToast(String(msg ?? "").replace(/\s+/g, " ").slice(0, 100)); } catch (e) { log.error("Reaction Spam: toast failed", e); }
     };
@@ -13,10 +12,10 @@
     const { useProxy } = vendetta.storage;
     const log = vendetta.logger;
 
-    const MAX_REACTIONS = 20; // Discord's hard limit of unique reactions per message
+    const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet;
+    let RestAPI, ActionSheet, EmojiStore;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
@@ -24,17 +23,40 @@
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    // ---- Emoji parsing ------------------------------------------------------------
+    function resolveShortcode(name) {
+        if (!EmojiStore) return null;
+        const ctx = EmojiStore.getDisambiguatedEmojiContext?.();
+        const emoji = ctx?.emojisByName?.[name] ?? ctx?.customEmojis?.[name];
+        if (emoji?.id) return `\( {emoji.name}: \){emoji.id}`;
+        // Fallback: scan guilds
+        const guilds = EmojiStore.getGuilds?.() ?? {};
+        for (const g of Object.values(guilds)) {
+            const found = (g.emojis || g._emojis || []).find(e => e.name === name);
+            if (found?.id) return `\( {found.name}: \){found.id}`;
+        }
+        return null;
+    }
 
-    // Accepts unicode emojis, <:name:id>, <a:name:id> or name:id, split on spaces/commas.
     function parseEmojis(raw) {
         const out = [];
         const seen = new Set();
-        const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
+        const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|:\w+:|[^\s,]+/g) ?? [];
         for (const t of tokens) {
-            const custom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
-            // Unicode emojis typed with no spaces between them ("😂💀🔥") are split apart here.
-            const keys = custom ? [`${custom[1]}:${custom[2]}`] : /[^\x00-\x7F]/.test(t) ? splitEmoji(t) : [t];
+            let keys = [];
+            const fullCustom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
+            const short = t.match(/^:(\w+):$/);
+            if (fullCustom) {
+                keys = [`\( {fullCustom[1]}: \){fullCustom[2]}`];
+            } else if (short) {
+                const resolved = resolveShortcode(short[1]);
+                if (resolved) keys = [resolved];
+            } else if (/[^\x00-\x7F]/.test(t)) {
+                keys = splitEmoji(t);
+            } else {
+                // plain name or name:id already handled above
+                const resolved = resolveShortcode(t);
+                keys = resolved ? [resolved] : [t];
+            }
             for (const key of keys) {
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -45,8 +67,6 @@
         return out;
     }
 
-    // Splits a run of emojis into individual emojis, keeping skin tones, ZWJ sequences,
-    // variation selectors, keycaps and flags together.
     function splitEmoji(str) {
         const cps = Array.from(str);
         const isMod = c => {
@@ -65,7 +85,7 @@
             if (isFlag(g) && i < cps.length && isFlag(cps[i])) g += cps[i++];
             while (i < cps.length) {
                 if (isMod(cps[i])) g += cps[i++];
-                else if (cps[i] === "" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
+                else if (cps[i] === "\u200D" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
                 else break;
             }
             out.push(g);
@@ -73,11 +93,9 @@
         return out;
     }
 
-    // ---- Reacting -----------------------------------------------------------------
-
     function addReaction(channelId, messageId, emoji) {
         return RestAPI.put({
-            url: `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+            url: `/channels/\( {channelId}/messages/ \){messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
             query: { location: "Message Reaction Picker", type: 0 }
         });
     }
@@ -91,7 +109,6 @@
         const msg = e?.body?.message ?? e?.message ?? (typeof e === "string" ? e : "");
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
     }
-
 
     async function spam(message) {
         if (running) return showToast("Reaction spam already running");
@@ -123,7 +140,6 @@
                         showToast(`No permission to react (${status}), stopped`);
                         return;
                     }
-                    // Bad emoji or some other per-emoji failure: skip it and carry on.
                     failed++;
                     lastError = e;
                     log.error("Reaction Spam: failed to add", emoji, e);
@@ -132,7 +148,7 @@
             }
             if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
             else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            else showToast(`Added ${sent}/${emojis.length} reaction(s)${failed ? `, ${failed} failed (${errorText(lastError)})` : ""}`);
+            else showToast(`Added \( {sent}/ \){emojis.length} reaction(s)${failed ? `, \( {failed} failed ( \){errorText(lastError)})` : ""}`);
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
@@ -140,8 +156,6 @@
             running = false;
         }
     }
-
-    // ---- Long-press menu ----------------------------------------------------------
 
     const isRow = el => el?.props && typeof el.props.label === "string" && typeof el.props.onPress === "function";
 
@@ -198,8 +212,6 @@
         }));
     }
 
-    // ---- Settings -----------------------------------------------------------------
-
     function Settings() {
         useProxy(storage);
         const { ScrollView, View, Text, TextInput } = ReactNative;
@@ -222,13 +234,12 @@
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
                     value: storage.emojis ?? "",
-                    placeholder: "😂 💀 🔥  or  <:name:id>",
+                    placeholder: "😂 💀 🔥  or  :skullcry:  or  <:name:id>",
                     placeholderTextColor: "#80848e",
                     onChangeText: v => { storage.emojis = v; }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Separate with spaces or commas. Custom emojis: <:name:id> or name:id. " +
-                    "Discord only allows 20 unique reactions per message, so duplicates are removed and the list is capped at 20.")
+                    "Separate with spaces or commas. Now supports :name: shortcodes for custom/gif emojis (resolves via EmojiStore). Custom: <:name:id> or name:id. Max 20 unique.")
             ),
             React.createElement(View, null,
                 React.createElement(Text, { style: label }, "Delay between reactions (ms)"),
@@ -251,7 +262,9 @@
             storage.emojis ??= DEFAULT_EMOJIS;
             storage.delay ??= "400";
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
+            EmojiStore = findByStoreName("EmojiStore");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
+            if (!EmojiStore) log.error("Reaction Spam: couldn't find EmojiStore");
             patchSheet();
         },
         onUnload() {
