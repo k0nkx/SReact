@@ -1,8 +1,12 @@
 (() => {
-    const { findByProps } = vendetta.metro;
+    const { findByProps, findByStoreName } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
     const { before, after } = vendetta.patcher;
     const { findInReactTree } = vendetta.utils;
+    const { showToast: rawToast } = vendetta.ui.toasts;
+    const showToast = msg => {
+        try { rawToast(String(msg ?? "").replace(/\s+/g, " ").slice(0, 100)); } catch (e) { log.error("Reaction Spam: toast failed", e); }
+    };
     const { getAssetIDByName } = vendetta.ui.assets;
     const { storage } = vendetta.plugin;
     const { useProxy } = vendetta.storage;
@@ -11,49 +15,90 @@
     const MAX_REACTIONS = 20;
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet, ReactionActions;
+    let RestAPI, ActionSheet, EmojiStore;
     const unpatches = [];
+    let unpatchSheet;
     let running = false;
     let cancelled = false;
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    // Completely safe "toast" – never touches Discord's toast system
-    function showToast(content) {
+    function resolveShortcode(name) {
         try {
-            log.info("[Reactions]", content);
-        } catch {}
-        console.log("[Reactions]", content);
+            if (!EmojiStore) return null;
+            const ctx = EmojiStore.getDisambiguatedEmojiContext?.();
+            let emoji = ctx?.emojisByName?.[name] ?? ctx?.customEmojis?.[name];
+            if (emoji?.id) return `\( {emoji.name}: \){emoji.id}`;
+            const guilds = EmojiStore.getGuilds?.() || {};
+            for (const g of Object.values(guilds)) {
+                const list = g.emojis || g._emojis || g.usableEmojis || [];
+                const found = list.find(e => e.name === name);
+                if (found?.id) return `\( {found.name}: \){found.id}`;
+            }
+        } catch (e) {
+            log.error("Reaction Spam: resolve failed", e);
+        }
+        return null;
     }
-
-    // ---- Emoji parsing ------------------------------------------------------------
 
     function parseEmojis(raw) {
         const out = [];
         const seen = new Set();
-        const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|[^\s,]+/g) ?? [];
+        const tokens = String(raw ?? "").match(/<a?:\w+:\d+>|\w+:\d+|:\w+:|[^\s,]+/g) ?? [];
         for (const t of tokens) {
-            const m = t.match(/^<?(a)?:?(\w+):(\d+)>?$/);
-            let apiKey, animated = false;
-            if (m) {
-                animated = !!m[1];
-                apiKey = `\( {m[2]}: \){m[3]}`;
+            let keys = [];
+            const fullCustom = t.match(/^<?a?:?(\w+):(\d+)>?$/);
+            const short = t.match(/^:(\w+):$/);
+            if (fullCustom) {
+                keys = [`\( {fullCustom[1]}: \){fullCustom[2]}`];
+            } else if (short) {
+                const resolved = resolveShortcode(short[1]);
+                if (resolved) keys = [resolved];
+            } else if (/[^\x00-\x7F]/.test(t)) {
+                keys = splitEmoji(t);
             } else {
-                apiKey = t;
+                const resolved = resolveShortcode(t);
+                keys = resolved ? [resolved] : [t];
             }
-            if (seen.has(apiKey)) continue;
-            seen.add(apiKey);
-            out.push({ apiKey, animated });
-            if (out.length >= MAX_REACTIONS) break;
+            for (const key of keys) {
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(key);
+                if (out.length >= MAX_REACTIONS) return out;
+            }
         }
         return out;
     }
 
-    // ---- Reacting -----------------------------------------------------------------
+    function splitEmoji(str) {
+        const cps = Array.from(str);
+        const isMod = c => {
+            const n = c.codePointAt(0);
+            return n === 0xFE0F || n === 0xFE0E || n === 0x20E3
+                || (n >= 0x1F3FB && n <= 0x1F3FF) || (n >= 0xE0020 && n <= 0xE007F);
+        };
+        const isFlag = c => {
+            const n = c.codePointAt(0);
+            return n >= 0x1F1E6 && n <= 0x1F1FF;
+        };
+        const out = [];
+        let i = 0;
+        while (i < cps.length) {
+            let g = cps[i++];
+            if (isFlag(g) && i < cps.length && isFlag(cps[i])) g += cps[i++];
+            while (i < cps.length) {
+                if (isMod(cps[i])) g += cps[i++];
+                else if (cps[i] === "\u200D" && i + 1 < cps.length) { g += cps[i] + cps[i + 1]; i += 2; }
+                else break;
+            }
+            out.push(g);
+        }
+        return out;
+    }
 
-    function addReaction(channelId, messageId, apiKey) {
+    function addReaction(channelId, messageId, emoji) {
         return RestAPI.put({
-            url: `/channels/\( {channelId}/messages/ \){messageId}/reactions/${encodeURIComponent(apiKey)}/@me`,
+            url: `/channels/\( {channelId}/messages/ \){messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
             query: { location: "Message Reaction Picker", type: 0 }
         });
     }
@@ -66,18 +111,6 @@
         const status = errorStatus(e);
         const msg = e?.body?.message ?? e?.message ?? (typeof e === "string" ? e : "");
         return [status, msg].filter(Boolean).join(" ") || "unknown error";
-    }
-
-    function toEmojiObject(apiKey, animated) {
-        const m = apiKey.match(/^(\w+):(\d+)$/);
-        return m
-            ? { id: m[2], name: m[1], animated: !!animated }
-            : { id: null, name: apiKey, animated: false };
-    }
-
-    async function addReactionFallback(channelId, messageId, apiKey, animated) {
-        if (!ReactionActions?.addReaction) throw new Error("no fallback available");
-        await ReactionActions.addReaction(channelId, messageId, toEmojiObject(apiKey, animated), "Message Reaction Picker");
     }
 
     async function spam(message) {
@@ -95,17 +128,10 @@
         let lastError = null;
 
         try {
-            for (const { apiKey, animated } of emojis) {
+            for (const emoji of emojis) {
                 if (cancelled) break;
                 try {
-                    try {
-                        await addReaction(message.channel_id, message.id, apiKey);
-                    } catch (e) {
-                        const status = errorStatus(e);
-                        if (status === 429 || status === 401 || status === 403) throw e;
-                        log.error("Reaction Spam: REST add failed, trying fallback", apiKey, e);
-                        await addReactionFallback(message.channel_id, message.id, apiKey, animated).catch(() => { throw e; });
-                    }
+                    await addReaction(message.channel_id, message.id, emoji);
                     sent++;
                 } catch (e) {
                     const status = errorStatus(e);
@@ -119,18 +145,13 @@
                     }
                     failed++;
                     lastError = e;
-                    log.error("Reaction Spam: failed to add", apiKey, e);
+                    log.error("Reaction Spam: failed to add", emoji, e);
                 }
                 if (delay) await sleep(delay);
             }
-            if (cancelled) {
-                showToast(`Stopped after ${sent} reaction(s)`);
-            } else if (!sent && lastError) {
-                showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
-            } else {
-                const extra = failed ? `, \( {failed} failed ( \){errorText(lastError)})` : "";
-                showToast(`Added \( {sent} reaction(s) \){extra}`);
-            }
+            if (cancelled) showToast(`Stopped after ${sent} reaction(s)`);
+            else if (!sent && lastError) showToast(`Added 0, all ${failed} failed: ${errorText(lastError)}`);
+            else showToast(`Added \( {sent}/ \){emojis.length} reaction(s)${failed ? `, \( {failed} failed ( \){errorText(lastError)})` : ""}`);
         } catch (e) {
             log.error("Reaction Spam:", e);
             showToast("Reaction spam failed, check logs");
@@ -139,117 +160,67 @@
         }
     }
 
-    // ---- Long-press menu ----------------------------------------------------------
+    const isRow = el => el?.props && typeof el.props.label === "string" && typeof el.props.onPress === "function";
+
+    function makeRow(template, key, label, iconNames, onPress) {
+        const props = { key, label, onPress };
+        const iconId = iconNames.map(n => getAssetIDByName?.(n)).find(Boolean);
+        const icon = template.props.icon;
+        if (iconId && React.isValidElement(icon)) props.icon = React.cloneElement(icon, { source: iconId });
+        else if (iconId && typeof icon === "number") props.icon = iconId;
+        return React.cloneElement(template, props);
+    }
+
+    function addRow(tree, message) {
+        const rows = findInReactTree(tree, x => Array.isArray(x) && x.some(isRow));
+        if (!rows || rows.some(r => r?.key === "reaction-spam")) return;
+        const template = rows.find(isRow);
+        if (!template) return;
+
+        rows.push(makeRow(
+            template,
+            "reaction-spam",
+            running ? "Stop Reaction Spam" : "Spam Reactions",
+            ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"],
+            () => {
+                ActionSheet?.hideActionSheet?.();
+                if (running) {
+                    cancelled = true;
+                    showToast("Stopping...");
+                } else {
+                    spam(message);
+                }
+            }
+        ));
+    }
 
     function patchSheet() {
         ActionSheet = findByProps("openLazy", "hideActionSheet");
-        if (!ActionSheet) {
-            log.error("Reaction Spam: couldn't find ActionSheet module");
-            return;
-        }
+        if (!ActionSheet) return log.error("Reaction Spam: couldn't find the action sheet module");
 
-        const ActionSheetRowModule = findByProps("ActionSheetRow");
-        const ActionSheetRow = ActionSheetRowModule?.ActionSheetRow;
-
-        unpatches.push(before("openLazy", ActionSheet, ([lazy, key, data]) => {
-            if (typeof key !== "string" || !key.includes("MessageLongPress")) return;
-
-            const msg = data?.message || (data?.messageId ? { id: data.messageId, channel_id: data.channel?.id || data.channelId } : null);
-            if (!msg?.id) return;
-
+        unpatches.push(before("openLazy", ActionSheet, ([lazy, key]) => {
+            if (unpatchSheet || typeof key !== "string" || !key.includes("MessageLongPress")) return;
             Promise.resolve(lazy).then(mod => {
-                if (!mod) return;
-
-                const unpatch = after("default", mod, (args, component) => {
-                    React.useEffect(() => () => { try { unpatch(); } catch {} }, []);
-
+                if (unpatchSheet || !mod) return;
+                const [target, prop] = typeof mod.default === "function" ? [mod, "default"]
+                    : typeof mod.default?.type === "function" ? [mod.default, "type"] : [];
+                if (!target) return log.error("Reaction Spam: unexpected message menu shape");
+                unpatchSheet = after(prop, target, ([props], tree) => {
                     try {
-                        let rows = findInReactTree(component, x =>
-                            Array.isArray(x) &&
-                            x.some(child =>
-                                child?.type?.name === "ButtonRow" ||
-                                child?.type?.name === "ActionSheetRow" ||
-                                (child?.props && typeof child.props.label === "string" && typeof child.props.onPress === "function")
-                            )
-                        );
-
-                        if (!rows) {
-                            rows = findInReactTree(component, x =>
-                                Array.isArray(x) &&
-                                x.length >= 2 &&
-                                x.filter(item =>
-                                    typeof item?.props?.onPress === "function" ||
-                                    item?.props?.label ||
-                                    item?.props?.title
-                                ).length >= 2
-                            );
-                        }
-
-                        if (!rows || rows.some(r => r?.key === "reaction-spam" || r?.props?.label === "Spam Reactions" || r?.props?.label === "Stop Reaction Spam")) {
-                            return;
-                        }
-
-                        const label = running ? "Stop Reaction Spam" : "Spam Reactions";
-                        const iconId = ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"]
-                            .map(n => getAssetIDByName?.(n))
-                            .find(Boolean);
-
-                        const onPress = () => {
-                            try { ActionSheet.hideActionSheet?.(); } catch {}
-                            if (running) {
-                                cancelled = true;
-                                showToast("Stopping...");
-                            } else {
-                                const fullMsg = {
-                                    id: msg.id,
-                                    channel_id: msg.channel_id || data?.channel?.id || data?.channelId
-                                };
-                                spam(fullMsg);
-                            }
-                        };
-
-                        if (ActionSheetRow) {
-                            rows.push(
-                                React.createElement(ActionSheetRow, {
-                                    key: "reaction-spam",
-                                    label,
-                                    icon: iconId ? React.createElement(ActionSheetRow.Icon || "img", { source: iconId }) : undefined,
-                                    onPress,
-                                })
-                            );
-                        } else {
-                            const template = rows.find(r =>
-                                r?.props && typeof r.props.label === "string" && typeof r.props.onPress === "function"
-                            );
-                            if (template) {
-                                const props = { key: "reaction-spam", label, onPress };
-                                if (iconId) {
-                                    if (React.isValidElement(template.props.icon)) {
-                                        props.icon = React.cloneElement(template.props.icon, { source: iconId });
-                                    } else {
-                                        props.icon = iconId;
-                                    }
-                                }
-                                rows.push(React.cloneElement(template, props));
-                            } else {
-                                rows.push({ key: "reaction-spam", label, onPress });
-                            }
-                        }
+                        if (props?.message?.id) addRow(tree, props.message);
                     } catch (e) {
-                        log.error("Reaction Spam: failed to inject button", e);
+                        log.error("Reaction Spam: couldn't add menu button", e);
                     }
                 });
-            }).catch(e => log.error("Reaction Spam: action sheet load error", e));
+            }).catch(e => log.error("Reaction Spam: action sheet error", e));
         }));
     }
-
-    // ---- Settings -----------------------------------------------------------------
 
     function Settings() {
         useProxy(storage);
         const { ScrollView, View, Text, TextInput } = ReactNative;
 
-        const labelStyle = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
+        const label = { color: "#ffffff", fontSize: 16, fontWeight: "600", marginBottom: 6 };
         const hint = { color: "#b5bac1", fontSize: 13, marginTop: 6 };
         const input = {
             color: "#ffffff",
@@ -262,21 +233,20 @@
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
             React.createElement(View, null,
-                React.createElement(Text, { style: labelStyle }, "Emojis (max 20)"),
+                React.createElement(Text, { style: label }, "Emojis (max 20)"),
                 React.createElement(TextInput, {
                     style: { ...input, minHeight: 80, textAlignVertical: "top" },
                     multiline: true,
                     value: storage.emojis ?? "",
-                    placeholder: "😂 💀 🔥  or  <:name:id>  or  <a:name:id>",
+                    placeholder: "😂 💀 🔥  or  :skullcry:  or  <:name:id>",
                     placeholderTextColor: "#80848e",
                     onChangeText: v => { storage.emojis = v; }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Separate with spaces or commas. Custom: <:name:id> or <a:name:id> or name:id. " +
-                    "Discord only allows 20 unique reactions per message.")
+                    "Supports :name: shortcodes. Custom emojis resolve automatically if you can see them.")
             ),
             React.createElement(View, null,
-                React.createElement(Text, { style: labelStyle }, "Delay between reactions (ms)"),
+                React.createElement(Text, { style: label }, "Delay between reactions (ms)"),
                 React.createElement(TextInput, {
                     style: input,
                     value: String(storage.delay ?? ""),
@@ -286,7 +256,7 @@
                     onChangeText: v => { storage.delay = v.replace(/[^0-9]/g, ""); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Long press a message → Spam Reactions. Stops on 429. Raise delay if needed.\n\nNote: Toasts are disabled to avoid a Discord crash. Check the console/logs for feedback.")
+                    "Long press a message → Spam Reactions.")
             )
         );
     }
@@ -295,18 +265,18 @@
         onLoad() {
             storage.emojis ??= DEFAULT_EMOJIS;
             storage.delay ??= "400";
-
             RestAPI = findByProps("getAPIBaseURL", "get", "put") ?? findByProps("getAPIBaseURL", "put");
+            EmojiStore = findByStoreName("EmojiStore");
             if (!RestAPI) log.error("Reaction Spam: couldn't find the REST API module");
-
-            ReactionActions = findByProps("addReaction", "removeReaction") ?? findByProps("addReaction");
-
+            if (!EmojiStore) log.error("Reaction Spam: couldn't find EmojiStore");
             patchSheet();
         },
         onUnload() {
             cancelled = true;
-            unpatches.splice(0).forEach(u => { try { u(); } catch {} });
+            unpatchSheet?.();
+            unpatchSheet = null;
+            unpatches.splice(0).forEach(u => u());
         },
         settings: Settings
     };
-})();
+})()
