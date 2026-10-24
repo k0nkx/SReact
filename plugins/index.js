@@ -13,27 +13,20 @@
 
     let RestAPI, ActionSheet, ReactionActions, uuid4;
     const unpatches = [];
-    let unpatchSheet;
     let running = false;
     let cancelled = false;
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    // Safe toast that works after Discord's toast API change
+    // Safe toast (works after Discord toast API change)
     function showToast(content, asset) {
         try {
-            // Prefer Kettu / Vendetta's wrapper if it exists and is healthy
             const vdShow = vendetta?.ui?.toasts?.showToast;
-            if (typeof vdShow === "function") {
-                return vdShow(content, asset);
-            }
+            if (typeof vdShow === "function") return vdShow(content, asset);
         } catch {}
 
-        // Fallback: call Discord's toasts.open the same way modern Kettu does
         try {
-            if (!uuid4) {
-                uuid4 = findByProps("uuid4")?.uuid4;
-            }
+            if (!uuid4) uuid4 = findByProps("uuid4")?.uuid4;
             if (toasts?.open) {
                 toasts.open({
                     key: `reactions-toast-${uuid4 ? uuid4() : Date.now()}`,
@@ -46,14 +39,11 @@
         } catch (e) {
             log.error("Reaction Spam: toast failed", e);
         }
-
-        // Last resort
         console.log("[Reactions]", content);
     }
 
     // ---- Emoji parsing ------------------------------------------------------------
 
-    // Returns { apiKey, animated }  apiKey is what goes in the URL (name:id or unicode)
     function parseEmojis(raw) {
         const out = [];
         const seen = new Set();
@@ -165,73 +155,127 @@
         }
     }
 
-    // ---- Long-press menu ----------------------------------------------------------
-
-    const isRow = el => el?.props && typeof el.props.label === "string" && typeof el.props.onPress === "function";
-
-    function makeRow(template, key, label, iconNames, onPress) {
-        const props = { key, label, onPress };
-        const iconId = iconNames.map(n => getAssetIDByName?.(n)).find(Boolean);
-        const icon = template.props.icon;
-        if (iconId && React.isValidElement(icon)) {
-            props.icon = React.cloneElement(icon, { source: iconId });
-        } else if (iconId && typeof icon === "number") {
-            props.icon = iconId;
-        }
-        return React.cloneElement(template, props);
-    }
-
-    function addRow(tree, message) {
-        const rows = findInReactTree(tree, x => Array.isArray(x) && x.some(isRow));
-        if (!rows || rows.some(r => r?.key === "reaction-spam")) return;
-        const template = rows.find(isRow);
-        if (!template) return;
-
-        rows.push(makeRow(
-            template,
-            "reaction-spam",
-            running ? "Stop Reaction Spam" : "Spam Reactions",
-            ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"],
-            () => {
-                ActionSheet?.hideActionSheet?.();
-                if (running) {
-                    cancelled = true;
-                    showToast("Stopping...");
-                } else {
-                    spam(message);
-                }
-            }
-        ));
-    }
+    // ---- Long-press menu (modern MessageLongPressActionSheet) ----------------------
 
     function patchSheet() {
         ActionSheet = findByProps("openLazy", "hideActionSheet");
         if (!ActionSheet) {
-            log.error("Reaction Spam: couldn't find the action sheet module");
+            log.error("Reaction Spam: couldn't find ActionSheet module");
             return;
         }
 
-        unpatches.push(before("openLazy", ActionSheet, ([lazy, key]) => {
-            if (unpatchSheet || typeof key !== "string" || !key.includes("MessageLongPress")) return;
+        // Try to get ActionSheetRow for modern Discord
+        const ActionSheetRowModule = findByProps("ActionSheetRow");
+        const ActionSheetRow = ActionSheetRowModule?.ActionSheetRow;
+
+        unpatches.push(before("openLazy", ActionSheet, ([lazy, key, data]) => {
+            // Modern key is exactly "MessageLongPressActionSheet"
+            if (typeof key !== "string" || !key.includes("MessageLongPress")) return;
+
+            const message = data?.message ?? data?.messageId ? data : null;
+            // Some builds put the message in different places
+            const msg = data?.message || (data?.channel && data?.messageId ? { id: data.messageId, channel_id: data.channel?.id || data.channelId } : null);
+            if (!msg?.id && !message?.id) return;
+
+            const targetMessage = msg?.id ? msg : message;
+
             Promise.resolve(lazy).then(mod => {
-                if (unpatchSheet || !mod) return;
-                const [target, prop] = typeof mod.default === "function"
-                    ? [mod, "default"]
-                    : typeof mod.default?.type === "function"
-                        ? [mod.default, "type"]
-                        : [];
-                if (!target) {
-                    log.error("Reaction Spam: unexpected message menu shape");
-                    return;
-                }
-                unpatchSheet = after(prop, target, ([props], tree) => {
+                if (!mod) return;
+
+                const unpatch = after("default", mod, (args, component) => {
+                    // Clean up this temporary patch when the sheet unmounts
+                    React.useEffect(() => () => { try { unpatch(); } catch {} }, []);
+
                     try {
-                        if (props?.message?.id) addRow(tree, props.message);
+                        // Strategy 1: find array of ButtonRow / ActionSheetRow
+                        let rows = findInReactTree(component, x =>
+                            Array.isArray(x) &&
+                            x.some(child =>
+                                child?.type?.name === "ButtonRow" ||
+                                child?.type?.name === "ActionSheetRow" ||
+                                (child?.props && typeof child.props.label === "string" && typeof child.props.onPress === "function")
+                            )
+                        );
+
+                        // Strategy 2: broader search for pressable rows
+                        if (!rows) {
+                            rows = findInReactTree(component, x =>
+                                Array.isArray(x) &&
+                                x.length >= 2 &&
+                                x.filter(item =>
+                                    typeof item?.props?.onPress === "function" ||
+                                    item?.props?.label ||
+                                    item?.props?.title
+                                ).length >= 2
+                            );
+                        }
+
+                        if (!rows || rows.some(r => r?.key === "reaction-spam" || r?.props?.label === "Spam Reactions" || r?.props?.label === "Stop Reaction Spam")) {
+                            return;
+                        }
+
+                        const label = running ? "Stop Reaction Spam" : "Spam Reactions";
+                        const iconId = ["ic_add_reaction_24px", "ReactionIcon", "EmojiNewIcon", "ic_emoji_24px"]
+                            .map(n => getAssetIDByName?.(n))
+                            .find(Boolean);
+
+                        const onPress = () => {
+                            try { ActionSheet.hideActionSheet?.(); } catch {}
+                            if (running) {
+                                cancelled = true;
+                                showToast("Stopping...");
+                            } else {
+                                // Reconstruct a usable message object
+                                const fullMsg = targetMessage.channel_id
+                                    ? targetMessage
+                                    : { id: targetMessage.id, channel_id: data?.channel?.id || data?.channelId || targetMessage.channel_id };
+                                spam(fullMsg);
+                            }
+                        };
+
+                        // Prefer creating a proper ActionSheetRow when available
+                        if (ActionSheetRow) {
+                            rows.push(
+                                React.createElement(ActionSheetRow, {
+                                    key: "reaction-spam",
+                                    label,
+                                    icon: iconId ? React.createElement(ActionSheetRow.Icon || "img", { source: iconId }) : undefined,
+                                    onPress,
+                                })
+                            );
+                        } else {
+                            // Fallback: clone an existing row
+                            const template = rows.find(r =>
+                                r?.props && typeof r.props.label === "string" && typeof r.props.onPress === "function"
+                            );
+                            if (template) {
+                                const props = {
+                                    key: "reaction-spam",
+                                    label,
+                                    onPress,
+                                };
+                                if (iconId) {
+                                    if (React.isValidElement(template.props.icon)) {
+                                        props.icon = React.cloneElement(template.props.icon, { source: iconId });
+                                    } else {
+                                        props.icon = iconId;
+                                    }
+                                }
+                                rows.push(React.cloneElement(template, props));
+                            } else {
+                                // Last resort: plain object style some older sheets accept
+                                rows.push({
+                                    key: "reaction-spam",
+                                    label,
+                                    onPress,
+                                });
+                            }
+                        }
                     } catch (e) {
-                        log.error("Reaction Spam: couldn't add menu button", e);
+                        log.error("Reaction Spam: failed to inject button", e);
                     }
                 });
-            }).catch(e => log.error("Reaction Spam: action sheet error", e));
+            }).catch(e => log.error("Reaction Spam: action sheet load error", e));
         }));
     }
 
@@ -278,7 +322,7 @@
                     onChangeText: v => { storage.delay = v.replace(/[^0-9]/g, ""); }
                 }),
                 React.createElement(Text, { style: hint },
-                    "Long press a message and tap Spam Reactions. It stops on 429. Raise the delay if needed.")
+                    "Long press a message → Spam Reactions. Stops on 429. Raise delay if needed.")
             )
         );
     }
@@ -297,9 +341,7 @@
         },
         onUnload() {
             cancelled = true;
-            unpatchSheet?.();
-            unpatchSheet = null;
-            unpatches.splice(0).forEach(u => u());
+            unpatches.splice(0).forEach(u => { try { u(); } catch {} });
         },
         settings: Settings
     };
