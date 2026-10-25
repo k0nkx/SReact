@@ -13,6 +13,7 @@
     // v3: no toasts at all. The run just finishes silently; status goes to the debug logs.
     // v4: added ";<preset> <message id>" to react on a specific message by its ID.
     // v5: the preset name comes first (e.g. ";spam 1563682914397323414" uses the preset named "spam").
+    // v6: ";<preset> <message id>" now finds the message in any channel of the current server, not just this one.
     const showToast = msg => {
         try { log.info("Reaction Spam: " + String(msg ?? "")); } catch (e) {}
     };
@@ -21,7 +22,7 @@
     const DEFAULT_CENSOR = "job work working shower soap employed";
     const DEFAULT_EMOJIS = "😂 💀 🔥 😭 👍 👎 ❤️ 😈 🤡 💯 👀 🙏 😎 🤔 🥶 🤯 😡 🎉 🫡 🗿";
 
-    let RestAPI, ActionSheet, MessageActions, MessageStore, UserStore;
+    let RestAPI, ActionSheet, MessageActions, MessageStore, UserStore, ChannelStore;
     const unpatches = [];
     let unpatchSheet;
     let running = false;
@@ -339,6 +340,60 @@
         return (await fetchRecent(channelId, 100, skipId)).find(m => m?.author?.id === userId) ?? null;
     }
 
+    // Finds which channel a message ID lives in. Checks the channel you're typing in first, then
+    // every text/announcement channel of the same server (announcements first). Messages Discord
+    // has already loaded are checked for free; after that each channel is asked for the message
+    // through the API (a 403/404 just means "not here" and is skipped). Returns a channel id or null.
+    async function locateMessageChannel(currentChannelId, messageId) {
+        try {
+            ChannelStore ??= findByStoreName?.("ChannelStore");
+            MessageStore ??= findByStoreName?.("MessageStore");
+        } catch (e) { /* ignore */ }
+
+        const ids = [currentChannelId];
+        try {
+            const guildId = ChannelStore?.getChannel?.(currentChannelId)?.guild_id;
+            if (guildId) {
+                let chans = [];
+                try {
+                    const m = ChannelStore.getMutableGuildChannelsForGuild?.(guildId);
+                    if (m) chans = Object.values(m);
+                } catch (e) { /* fall through to REST */ }
+                if (!chans.length) {
+                    try { chans = (await RestAPI.get({ url: `/guilds/${guildId}/channels` }))?.body ?? []; } catch (e) { /* ignore */ }
+                }
+                const isAnn = c => c.type === 5 || /announce|news/i.test(c.name ?? "");
+                chans = chans.filter(c => c && (c.type === 0 || c.type === 5) && c.id !== currentChannelId)
+                    .sort((a, b) => isAnn(b) - isAnn(a));
+                for (const c of chans) ids.push(c.id);
+            }
+        } catch (e) {
+            log.error("Reaction Spam: couldn't list the server's channels", e);
+        }
+
+        // Free check: messages already loaded in the app.
+        for (const cid of ids) {
+            try { if (MessageStore?.getMessage?.(cid, messageId)) return cid; } catch (e) { /* ignore */ }
+        }
+
+        // API check, one channel at a time (gentle, so Discord doesn't rate limit).
+        const gap = Math.max(150, Math.min(500, parseInt(storage.delay, 10) || 0));
+        for (const cid of ids.slice(0, 150)) {
+            try {
+                const res = await withRetry(() => RestAPI.get({
+                    url: `/channels/${cid}/messages`,
+                    query: { around: messageId, limit: 1 }
+                }));
+                if (Array.isArray(res?.body) && res.body.some(m => m?.id === messageId)) return cid;
+            } catch (e) {
+                const st = errorStatus(e);
+                if (st !== 403 && st !== 404 && st !== 400) log.error("Reaction Spam: channel lookup failed", cid, e);
+            }
+            await sleep(gap);
+        }
+        return null;
+    }
+
     // Removes YOUR reactions from the given messages (Discord only lets you remove your own here).
     async function removeMyReactions(messages, channelId) {
         const del = RestAPI.del ?? RestAPI.delete;
@@ -411,7 +466,7 @@
 
     // Commands (default prefix ";"):
     //   ;flame @someone         -> spam the closest-named preset onto their latest message
-    //   ;flame <message id>     -> spam the closest-named preset onto that message (in this channel)
+    //   ;flame <message id>     -> spam the closest-named preset onto that message (any channel in this server)
     //   ;undo 10                -> remove your reactions from the last 10 messages
     //   ;undo @someone          -> remove your reactions from their latest reacted-to message
     // Returns true if the text was a command (so the original message isn't sent).
@@ -472,7 +527,12 @@
                     storage.lastRun = `Command "${query.trim()}": no preset with a similar name`;
                     return "no matching preset";
                 }
-                const result = await spam({ id: messageId, channel_id: channelId }, preset);
+                const targetChannel = await locateMessageChannel(channelId, messageId);
+                if (!targetChannel) {
+                    storage.lastRun = `${preset.name}: couldn't find message ${messageId} in this server`;
+                    return "message not found";
+                }
+                const result = await spam({ id: messageId, channel_id: targetChannel }, preset);
                 return result && result.sent > 0 ? "finished" : "failed";
             };
         } else if (meCmd) {
@@ -795,7 +855,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v16 (presets, commands, censor, purge, react by ID)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v17 (presets, commands, censor, purge, react by ID)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -815,7 +875,7 @@
                 }),
                 React.createElement(Text, { style: hint },
                     "Commands: \";flame @someone\" adds the closest-named preset's emojis to their latest message. " +
-                    "\";flame 1563682914397323414\" adds the closest-named preset's emojis to that message ID (in this chat). " +
+                    "\";flame 1563682914397323414\" adds the closest-named preset's emojis to that message ID, found in any channel of this server. " +
                     "\";undo 10\" removes your reactions from the last 10 messages, \";undo @someone\" from their latest reacted-to message. " +
                     "\";me 10\" deletes your last 10 messages in that chat, however old. " +
                     "Your command shows in chat, changes to \"finished\", then is deleted 2 seconds later.")
