@@ -11,6 +11,8 @@
     // Discord's own toast container crashes ("Cannot read property 'position' of undefined"),
     // so use the native Android toast instead. Falls back to an alert on other platforms.
     // v3: no toasts at all. The run just finishes silently; status goes to the debug logs.
+    // v4: added ";<preset> <message id>" to react on a specific message by its ID.
+    // v5: the preset name comes first (e.g. ";spam 1563682914397323414" uses the preset named "spam").
     const showToast = msg => {
         try { log.info("Reaction Spam: " + String(msg ?? "")); } catch (e) {}
     };
@@ -408,9 +410,10 @@
     }
 
     // Commands (default prefix ";"):
-    //   ;flame @someone   -> spam the closest-named preset onto their latest message
-    //   ;undo 10          -> remove your reactions from the last 10 messages
-    //   ;undo @someone    -> remove your reactions from their latest reacted-to message
+    //   ;flame @someone         -> spam the closest-named preset onto their latest message
+    //   ;flame <message id>     -> spam the closest-named preset onto that message (in this channel)
+    //   ;undo 10                -> remove your reactions from the last 10 messages
+    //   ;undo @someone          -> remove your reactions from their latest reacted-to message
     // Returns true if the text was a command (so the original message isn't sent).
     function handleCommand(channelId, content) {
         const prefix = storage.prefix || ";";
@@ -422,6 +425,7 @@
         const meCmd = body.match(/^\s*me\s+(\d{1,3})(?:\s+(silent|normal))?\s*$/i);
         const censorCmd = body.match(/^\s*(un)?censor\s*$/i);
         const spamCmd = body.match(/^\s*([\w -]+?)\s+<@!?(\d+)>\s*$/);
+        const spamIdCmd = body.match(/^\s*([\w -]+?)\s+(\d{15,22})\s*$/);
 
         let job;
         if (undoUser) {
@@ -458,6 +462,17 @@
                     return "no recent message found";
                 }
                 const result = await spam({ id: target.id, channel_id: target.channel_id ?? channelId }, preset);
+                return result && result.sent > 0 ? "finished" : "failed";
+            };
+        } else if (spamIdCmd) {
+            const [, query, messageId] = spamIdCmd;
+            job = async () => {
+                const preset = findClosestPreset(query);
+                if (!preset) {
+                    storage.lastRun = `Command "${query.trim()}": no preset with a similar name`;
+                    return "no matching preset";
+                }
+                const result = await spam({ id: messageId, channel_id: channelId }, preset);
                 return result && result.sent > 0 ? "finished" : "failed";
             };
         } else if (meCmd) {
@@ -780,7 +795,7 @@
         ));
 
         return React.createElement(ScrollView, { contentContainerStyle: { padding: 16, gap: 20 } },
-            React.createElement(Text, { style: hint }, "Reaction Spam v14 (presets, commands, censor, purge)"),
+            React.createElement(Text, { style: hint }, "Reaction Spam v16 (presets, commands, censor, purge, react by ID)"),
             React.createElement(Text, { style: hint }, "Last run: " + (storage.lastRun ?? "none yet")),
             React.createElement(Text, { style: hint }, (() => {
                 try { return "Custom emojis Discord has loaded: " + customEmojiList().length; } catch (e) { return "Custom emoji lookup failed"; }
@@ -800,6 +815,7 @@
                 }),
                 React.createElement(Text, { style: hint },
                     "Commands: \";flame @someone\" adds the closest-named preset's emojis to their latest message. " +
+                    "\";flame 1563682914397323414\" adds the closest-named preset's emojis to that message ID (in this chat). " +
                     "\";undo 10\" removes your reactions from the last 10 messages, \";undo @someone\" from their latest reacted-to message. " +
                     "\";me 10\" deletes your last 10 messages in that chat, however old. " +
                     "Your command shows in chat, changes to \"finished\", then is deleted 2 seconds later.")
